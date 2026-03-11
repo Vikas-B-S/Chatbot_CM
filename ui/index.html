@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>MNEMO — Contextual AI</title>
+<title>Synapse</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
 <style>
@@ -634,6 +634,26 @@ header {
 #toast.show { transform: translateX(-50%) translateY(0); }
 
 * { scrollbar-width: thin; scrollbar-color: var(--border2) transparent; }
+
+.password-strength{
+  font-family: var(--font-mono);
+  font-size: 9px;
+  margin-top:6px;
+  letter-spacing:0.08em;
+  color:var(--text3);
+}
+
+.password-strength.weak{
+  color:var(--red);
+}
+
+.password-strength.medium{
+  color:var(--amber);
+}
+
+.password-strength.strong{
+  color:var(--green);
+}
 </style>
 </head>
 <body>
@@ -641,7 +661,7 @@ header {
 <!-- ── Auth Overlay ─────────────────────────────────────────── -->
 <div id="auth-overlay">
   <div class="auth-box">
-    <div class="auth-logo"><div class="auth-logo-dot"></div>MNEMO</div>
+    <div class="auth-logo"><div class="auth-logo-dot"></div>Synapse</div>
     <div class="auth-tagline">// persistent contextual ai — identify yourself</div>
 
     <div class="auth-api-row">
@@ -660,6 +680,11 @@ header {
         <label>Email Address</label>
         <input type="email" id="signin-email" placeholder="you@example.com" autocomplete="email"/>
       </div>
+
+      <div class="auth-field">
+        <label>Password</label>
+        <input type="password" id="signin-password" placeholder="your password" autocomplete="current-password"/>
+      </div>
       <button class="btn-primary" id="btn-signin" onclick="doSignin()">Sign In →</button>
       <div class="auth-error" id="signin-error"></div>
     </div>
@@ -672,8 +697,24 @@ header {
       </div>
       <div class="auth-field">
         <label>Preferred Name</label>
-        <input type="text" id="signup-name" placeholder="how should MNEMO call you?" autocomplete="name"/>
+        <input type="text" id="signup-name" placeholder="how should Synapse call you?" autocomplete="name"/>
         <div class="field-hint">// used as your display name across all sessions</div>
+      </div>
+      <div class="auth-field">
+
+      <label>Password</label>
+
+      <input
+      type="password"
+      id="signup-password"
+      placeholder="8+ chars, 1 uppercase, 1 lowercase, 1 special"
+      autocomplete="new-password"
+      />
+
+      <div id="password-strength" class="password-strength">
+      strength: —
+      </div>
+
       </div>
       <button class="btn-primary" id="btn-signup" onclick="doSignup()">Create Account →</button>
       <div class="auth-error" id="signup-error"></div>
@@ -683,7 +724,7 @@ header {
 
 <!-- ── Header ───────────────────────────────────────────────── -->
 <header>
-  <div class="logo"><div class="logo-dot"></div>MNEMO</div>
+  <div class="logo"><div class="logo-dot"></div>Synapse</div>
 
   <!-- Session pill + dropdown -->
   <div class="header-center">
@@ -766,7 +807,7 @@ header {
     <div class="messages" id="messages">
       <div class="welcome" id="welcome">
         <h2>Start a conversation</h2>
-        <p>MNEMO learns from everything you say — facts, preferences, goals and constraints are stored in a persistent temporal memory graph.</p>
+        <p>Synapse learns from everything you say — facts, preferences, goals and constraints are stored in a persistent temporal memory graph.</p>
         <div class="welcome-grid">
           <div class="welcome-card" onclick="fillMsg(this)">
             <div class="wc-label">introduce yourself</div>
@@ -790,7 +831,7 @@ header {
 
     <div class="input-area">
       <div class="input-wrap">
-        <textarea id="msg-input" placeholder="message MNEMO…" rows="1"></textarea>
+        <textarea id="msg-input" placeholder="message Synapse…" rows="1"></textarea>
         <button class="send-btn" id="send-btn" onclick="sendMessage()">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
@@ -846,15 +887,52 @@ function showError(id, msg) {
   el.style.display = 'block';
 }
 
+const passwordInput = document.getElementById("signup-password");
+const strengthText = document.getElementById("password-strength");
+
+if(passwordInput){
+
+passwordInput.addEventListener("input", () => {
+
+  const val = passwordInput.value;
+
+  let score = 0;
+
+  if(val.length >= 8) score++;
+  if(/[A-Z]/.test(val)) score++;
+  if(/[a-z]/.test(val)) score++;
+  if(/[^A-Za-z0-9]/.test(val)) score++;
+
+  strengthText.className = "password-strength";
+
+  if(score <= 1){
+    strengthText.textContent = "strength: weak";
+    strengthText.classList.add("weak");
+  }
+  else if(score === 2 || score === 3){
+    strengthText.textContent = "strength: medium";
+    strengthText.classList.add("medium");
+  }
+  else{
+    strengthText.textContent = "strength: strong";
+    strengthText.classList.add("strong");
+  }
+
+});
+
+}
+
 // ── Enter key on auth fields ───────────────────────────────
 document.getElementById('signin-email').addEventListener('keydown', e => { if (e.key === 'Enter') doSignin(); });
 document.getElementById('signup-name').addEventListener('keydown',  e => { if (e.key === 'Enter') doSignup(); });
 
 // ── Sign In ────────────────────────────────────────────────
 async function doSignin() {
-  const email = document.getElementById('signin-email').value.trim();
+  const email    = document.getElementById('signin-email').value.trim();
+  const password = document.getElementById('signin-password').value;
   API = document.getElementById('api-url-input').value.trim().replace(/\/$/, '');
-  if (!email) return showError('signin-error', 'email is required');
+  if (!email)    return showError('signin-error', 'email is required');
+  if (!password) return showError('signin-error', 'password is required');
 
   const btn = document.getElementById('btn-signin');
   btn.disabled = true; btn.textContent = 'signing in…';
@@ -862,7 +940,7 @@ async function doSignin() {
   try {
     const res = await fetch(`${API}/auth/login`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ email })
+      body: JSON.stringify({ email, password })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'login failed');
@@ -877,31 +955,67 @@ async function doSignin() {
 
 // ── Sign Up ────────────────────────────────────────────────
 async function doSignup() {
+
   const email = document.getElementById('signup-email').value.trim();
   const name  = document.getElementById('signup-name').value.trim();
+  const password = document.getElementById('signup-password').value;
+
   API = document.getElementById('api-url-input').value.trim().replace(/\/$/, '');
 
-  if (!email) return showError('signup-error', 'email is required');
-  if (!name)  return showError('signup-error', 'preferred name is required');
+  if (!email)
+    return showError('signup-error', 'email is required');
+
+  if (!name)
+    return showError('signup-error', 'preferred name is required');
+
+  if (!password)
+    return showError('signup-error', 'password is required');
+
+  const strongPassword =
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*[^A-Za-z0-9]).{8,}$/;
+
+  if (!strongPassword.test(password))
+    return showError(
+      'signup-error',
+      'password must be 8+ chars with 1 uppercase, 1 lowercase, and 1 special character'
+    );
 
   const btn = document.getElementById('btn-signup');
-  btn.disabled = true; btn.textContent = 'creating account…';
+  btn.disabled = true;
+  btn.textContent = 'creating account…';
 
   try {
+
     const res = await fetch(`${API}/auth/signup`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ email, username: name })
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        email,
+        username: name,
+        password
+      })
     });
+
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'signup failed');
+
+    if (!res.ok)
+      throw new Error(data.detail || 'signup failed');
 
     allSessions = [];
+
     initApp(data.user, data.session);
-    showToast('welcome to MNEMO, ' + name + '!');
+
+    showToast('welcome to Synapse, ' + name + '!');
+
   } catch(e) {
+
     showError('signup-error', e.message);
-    btn.disabled = false; btn.textContent = 'Create Account →';
+
+    btn.disabled = false;
+    btn.textContent = 'Create Account →';
+
   }
+
 }
 
 // ── Init App ───────────────────────────────────────────────
@@ -940,7 +1054,7 @@ function doLogout() {
   document.getElementById('messages').innerHTML = `
     <div class="welcome" id="welcome">
       <h2>Start a conversation</h2>
-      <p>MNEMO learns from everything you say — facts, preferences, goals and constraints are stored in a persistent temporal memory graph.</p>
+      <p>Synapse learns from everything you say — facts, preferences, goals and constraints are stored in a persistent temporal memory graph.</p>
       <div class="welcome-grid">
         <div class="welcome-card" onclick="fillMsg(this)"><div class="wc-label">introduce yourself</div><div class="wc-text">Hi! I'm a Python developer from Berlin working on ML projects</div></div>
         <div class="welcome-card" onclick="fillMsg(this)"><div class="wc-label">set a goal</div><div class="wc-text">I want to build a production RAG pipeline by end of month</div></div>
@@ -963,8 +1077,10 @@ function doLogout() {
 
   // Reset signin form
   document.getElementById('signin-email').value = '';
+  document.getElementById('signin-password').value = '';
   document.getElementById('signup-email').value = '';
   document.getElementById('signup-name').value  = '';
+  document.getElementById('signup-password').value = '';
   hideAuthErrors();
   document.getElementById('btn-signin').disabled = false;
   document.getElementById('btn-signin').textContent = 'Sign In →';
@@ -1038,7 +1154,7 @@ async function newSession(e) {
     document.getElementById('messages').innerHTML = `
       <div class="welcome" id="welcome">
         <h2>Start a conversation</h2>
-        <p>New session started. Your memory graph is still intact — everything you've told MNEMO before is remembered.</p>
+        <p>New session started. Your memory graph is still intact — everything you've told Synapse before is remembered.</p>
         <div class="welcome-grid">
           <div class="welcome-card" onclick="fillMsg(this)"><div class="wc-label">continue a topic</div><div class="wc-text">Let's pick up where we left off on my ML project</div></div>
           <div class="welcome-card" onclick="fillMsg(this)"><div class="wc-label">update a preference</div><div class="wc-text">I've switched from Python to Go for my backend work</div></div>
@@ -1162,7 +1278,7 @@ function addMessage(role, text, turn, badges = []) {
   meta.className = 'msg-meta';
   meta.innerHTML = role === 'user'
     ? `<span>${username}</span> <span class="turn-tag">T${turn}</span>`
-    : `<span>MNEMO</span> <span class="turn-tag">T${turn}</span>`;
+    : `<span>Synapse</span> <span class="turn-tag">T${turn}</span>`;
 
   const bubble = document.createElement('div');
   bubble.className = 'msg-bubble';
@@ -1194,7 +1310,7 @@ function addTyping() {
   const div = document.createElement('div');
   div.className = 'message assistant'; div.id = id;
   const meta = document.createElement('div');
-  meta.className = 'msg-meta'; meta.innerHTML = '<span>MNEMO</span>';
+  meta.className = 'msg-meta'; meta.innerHTML = '<span>Synapse</span>';
   const bubble = document.createElement('div');
   bubble.className = 'typing-bubble';
   bubble.innerHTML = '<div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>';

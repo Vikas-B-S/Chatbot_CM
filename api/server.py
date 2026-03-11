@@ -104,10 +104,12 @@ async def root():
 class SignupReq(BaseModel):
     email:    str
     username: str        # preferred display name
+    password: str
     metadata: dict = {}
 
 class LoginReq(BaseModel):
-    email: str
+    email:    str
+    password: str
 
 class CreateSessionReq(BaseModel):
     user_id: str
@@ -153,12 +155,14 @@ async def signup(req: SignupReq):
     Create a new account. Email must be unique. Username is display name.
     Automatically creates the first session.
     """
+    if not req.password or len(req.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters.")
     if await sql.get_user_by_email(req.email):
         raise HTTPException(400, f"An account with email '{req.email}' already exists. Use /auth/login instead.")
     if await sql.get_user_by_username(req.username):
         raise HTTPException(400, f"Username '{req.username}' is taken. Choose another.")
 
-    user = await sql.create_user(req.username, req.email, req.metadata)
+    user = await sql.create_user(req.username, req.email, req.password, req.metadata)
 
     # Seed Graphiti with user identity
     try:
@@ -185,6 +189,10 @@ async def login(req: LoginReq):
     user = await sql.get_user_by_email(req.email)
     if not user:
         raise HTTPException(404, "No account found with that email. Please sign up.")
+    if not user.get("password_hash") or not sql.verify_password(req.password, user["password_hash"]):
+        raise HTTPException(401, "Incorrect password.")
+    # Strip password_hash before returning
+    user = {k: v for k, v in user.items() if k != "password_hash"}
 
     # Create a new session for this login
     existing = await sql.get_user_sessions(user["user_id"])

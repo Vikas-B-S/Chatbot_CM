@@ -1,14 +1,13 @@
 """
 db/sqlite_manager.py
-SQLite — operational data only: users, sessions, raw turn logs.
-
-All user memory (facts, preferences, goals, constraints) lives in Neo4j/Graphiti.
-Episodic memories live in MongoDB.
-Summaries live in Redis.
+SQLite — operational data: users (with hashed passwords), sessions, raw turn logs.
 """
 import aiosqlite
 import json
 import uuid
+import hashlib
+import hmac
+import os
 from datetime import datetime
 from typing import Optional
 from config import get_settings
@@ -20,12 +19,30 @@ def get_db():
     return aiosqlite.connect(settings.sqlite_db_path)
 
 
+# ─── Password helpers (no extra deps — PBKDF2 via stdlib) ─────
+
+def _hash_password(password: str) -> str:
+    """Return a salted PBKDF2-SHA256 hash string: salt$hash"""
+    salt = os.urandom(16).hex()
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
+    return f"{salt}${h.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Constant-time comparison to prevent timing attacks."""
+    try:
+        salt, h = stored_hash.split("$", 1)
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
+        return hmac.compare_digest(candidate.hex(), h)
+    except Exception:
+        return False
+
+
 async def init_db():
-    """Create all operational tables + run migrations for existing DBs."""
+    """Create all tables + run migrations for existing DBs."""
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
 
-        # ── Create tables (new installs) ──────────────────────
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id     TEXT PRIMARY KEY,
@@ -61,33 +78,33 @@ async def init_db():
             ON turn_logs(user_id);
         """)
 
-        # ── Migrations — add new columns to existing DBs ──────
-        # Each ALTER is wrapped in try/except so it silently skips
-        # if the column already exists (SQLite has no IF NOT EXISTS for ALTER)
+        # Migrations — silently skip if column already exists
         migrations = [
-            "ALTER TABLE users    ADD COLUMN email TEXT",
-            "ALTER TABLE sessions ADD COLUMN name  TEXT DEFAULT NULL",
+            "ALTER TABLE users    ADD COLUMN email         TEXT",
+            "ALTER TABLE users    ADD COLUMN password_hash TEXT",
+            "ALTER TABLE sessions ADD COLUMN name          TEXT DEFAULT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)",
         ]
         for sql in migrations:
             try:
                 await db.execute(sql)
             except Exception:
-                pass  # column/index already exists
+                pass
 
         await db.commit()
 
 
 # ─── User CRUD ────────────────────────────────────────────────
 
-async def create_user(username: str, email: str, metadata: dict = None) -> dict:
+async def create_user(username: str, email: str, password: str, metadata: dict = None) -> dict:
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     now = datetime.utcnow().isoformat()
+    pw_hash = _hash_password(password)
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         await db.execute(
-            "INSERT INTO users (user_id, username, email, created_at, metadata) VALUES (?,?,?,?,?)",
-            (user_id, username, email.lower().strip(), now, json.dumps(metadata or {}))
+            "INSERT INTO users (user_id, username, email, password_hash, created_at, metadata) VALUES (?,?,?,?,?,?)",
+            (user_id, username, email.lower().strip(), pw_hash, now, json.dumps(metadata or {}))
         )
         await db.commit()
     return {"user_id": user_id, "username": username, "email": email, "created_at": now}

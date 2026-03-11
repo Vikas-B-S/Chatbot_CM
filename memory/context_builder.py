@@ -3,12 +3,14 @@ memory/context_builder.py
 Builds the full context window for each chat turn.
 
 Context order (most persistent → most recent):
-  1. User memories from Neo4j   — facts, preferences, goals, constraints
-  2. Episodic memories (MongoDB)— recent meaningful narrative episodes
-  3. Summaries from Redis       — compressed history (prefers L1 meta-summaries)
-  4. Last 6 raw turns (SQLite)  — the immediate sliding window
+  1. Graphiti (Neo4j) — hybrid search scoped to user_message for relevance
+  2. Episodic memories (MongoDB) — recent meaningful narrative episodes
+  3. Summaries from Redis — compressed history (prefers L1 meta-summaries)
+  4. Last 6 raw turns (SQLite) — the immediate sliding window
 
-All fetches run concurrently. Graceful degradation if any store is down.
+Key change from v1: get_user_memories() now receives the user_message so
+Graphiti does a TARGETED semantic search instead of a broad profile dump.
+This means context is always relevant to what the user just asked.
 """
 import asyncio
 from config import get_settings
@@ -43,15 +45,24 @@ def should_summarize(turn_number: int) -> tuple[bool, int, int]:
 async def build_context(
     session_id: str,
     user_id: str,
-    user_message: str = ""    # add this line
+    user_message: str = ""     # ← NEW: passed through for targeted Graphiti search
 ) -> dict:
-    """Parallel fetch from all stores, graceful degradation on errors."""
+    """
+    Parallel fetch from all stores. Graceful degradation if any store is down.
+
+    user_message is forwarded to get_user_memories() so Graphiti performs
+    a targeted hybrid search (semantic + BM25 + graph) against what the
+    user just said — returning the most RELEVANT memories, not just all of them.
+
+    If user_message is empty (e.g. context preview endpoint) falls back
+    to a broad profile sweep.
+    """
     def safe(v):
         return v if not isinstance(v, Exception) else []
 
     results = await asyncio.gather(
-        neo4j.get_user_memories(user_id),
-        mongo.get_user_episodic_memories(user_id, limit=3, session_id=session_id),
+        neo4j.get_user_memories(user_id, query=user_message or None),
+        mongo.get_user_episodic_memories(user_id, limit=3, session_id=session_id, query=user_message or None),
         redis_mgr.get_latest_summaries_for_context(session_id),
         sql.get_last_n_turns(session_id, n=settings.max_raw_turns),
         return_exceptions=True
@@ -59,26 +70,31 @@ async def build_context(
 
     memories, episodic, summaries, raw_turns = results
     return {
-        "memories":         safe(memories),
+        "memories":          safe(memories),
         "episodic_memories": safe(episodic),
-        "summaries":        safe(summaries),
-        "raw_turns":        safe(raw_turns),
+        "summaries":         safe(summaries),
+        "raw_turns":         safe(raw_turns),
     }
 
 
 def format_context_for_prompt(context: dict) -> str:
     """
-    Format all context into a clean, structured prompt section.
-    Ordered: most persistent (facts) → most recent (raw turns).
+    Format all context into a clean structured prompt section.
+    Ordered: most persistent (Graphiti facts) → most recent (raw turns).
+
+    Graphiti returns flat facts with inferred memory_type — we group them
+    by type for clean presentation to the LLM.
     """
     parts = []
 
-    # ── 1. User Memory from Neo4j (all types) ─────────────────
+    # ── 1. Graphiti memory — grouped by type ──────────────────
     memories = context.get("memories", [])
     if memories:
+        # Group by memory_type
         by_type: dict[str, list] = {}
         for m in memories:
-            by_type.setdefault(m.get("memory_type", "fact"), []).append(m["content"])
+            t = m.get("memory_type", "fact")
+            by_type.setdefault(t, []).append(m.get("content", ""))
 
         sections = [
             ("fact",       "## About This User"),
@@ -127,7 +143,7 @@ def format_context_for_prompt(context: dict) -> str:
 def format_context_for_router(context: dict) -> str:
     """
     Compact context string for the router's LLM call.
-    Only needs recent summaries + last user message for good routing decisions.
+    Only needs recent summaries + last 2 turns.
     """
     parts = []
     summaries = context.get("summaries", [])
@@ -137,7 +153,7 @@ def format_context_for_router(context: dict) -> str:
         last = summaries[-1]
         parts.append(f"Recent summary: {last['summary_text'][:200]}")
     if raw:
-        for t in raw[-2:]:   # last 2 turns for context
+        for t in raw[-2:]:
             parts.append(f"User: {t['user_msg'][:120]}")
             parts.append(f"Assistant: {t['assistant_msg'][:120]}")
     return "\n".join(parts)
