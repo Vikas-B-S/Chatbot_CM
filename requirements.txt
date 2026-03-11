@@ -1,0 +1,30 @@
+# ── LLM + API ─────────────────────────────────────────────────
+openai>=1.30.0          # OpenRouter uses OpenAI-compatible client
+
+# ── Neo4j + Graphiti ──────────────────────────────────────────
+# IMPORTANT: Graphiti requires Neo4j >= 5.21 (not 5.14)
+neo4j>=5.21.0
+graphiti-core>=0.25.5   # latest — temporal knowledge graph
+
+# Graphiti's required sub-dependencies (pulled in automatically,
+# pinned here for reproducibility)
+diskcache>=5.6.0        # graphiti episode cache
+numpy>=1.26.0           # graphiti vector ops
+tenacity>=8.2.0         # retry logic for LLM calls
+posthog>=3.0.0          # graphiti telemetry (can disable via env)
+
+# ── Other databases ───────────────────────────────────────────
+motor>=3.3.0            # async MongoDB (episodic memories)
+redis>=5.0.0            # async Redis (summaries)
+aiosqlite>=0.20.0       # async SQLite (users, sessions, turns)
+
+# ── FastAPI + server ──────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+aiofiles>=23.0.0        # required by FastAPI StaticFiles (UI serving)
+
+# ── Config + utilities ────────────────────────────────────────
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+httpx>=0.27.0

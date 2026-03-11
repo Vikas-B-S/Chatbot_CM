@@ -1,0 +1,199 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 780" font-family="'Segoe UI',system-ui,sans-serif">
+  <rect width="960" height="780" fill="#0b1120" rx="14"/>
+
+  <!-- Title -->
+  <text x="480" y="36" text-anchor="middle" fill="#f1f5f9" font-size="17" font-weight="700">Multi-User Contextual Chatbot — Architecture v3</text>
+  <text x="480" y="56" text-anchor="middle" fill="#64748b" font-size="11">Memory Router Node · Neo4j (all user memory) · MongoDB (episodic) · Redis (summaries) · SQLite (operational)</text>
+
+  <!-- ── API Layer ────────────────────────────────────────── -->
+  <rect x="310" y="72" width="340" height="46" rx="8" fill="#162032" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="480" y="91" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="600">FastAPI  /chat · /users · /sessions · /memory</text>
+  <text x="480" y="108" text-anchor="middle" fill="#1e40af" font-size="10">Multi-user · Multi-session · Graceful degradation</text>
+
+  <!-- arrow API → Agent -->
+  <line x1="480" y1="118" x2="480" y2="145" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ── Agent box ───────────────────────────────────────── -->
+  <rect x="200" y="145" width="560" height="58" rx="8" fill="#111827" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="480" y="166" text-anchor="middle" fill="#a5b4fc" font-size="12" font-weight="600">ChatAgent   (core/agent.py)</text>
+  <text x="480" y="184" text-anchor="middle" fill="#4b5563" font-size="10">1. Build context  →  2. Generate response (Claude)  →  3. Save turn  →  4+5. Route + Summarize (parallel)</text>
+
+  <!-- arrows from agent -->
+  <line x1="310" y1="203" x2="200" y2="245" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="480" y1="203" x2="480" y2="245" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="650" y1="203" x2="760" y2="245" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ═══════ MEMORY ROUTER NODE (centre) ═══════ -->
+  <rect x="340" y="245" width="280" height="130" rx="10" fill="#0f172a" stroke="#f59e0b" stroke-width="2"/>
+  <text x="480" y="267" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="700">Memory Router Node</text>
+  <text x="480" y="283" text-anchor="middle" fill="#78350f" font-size="10">core/router.py  —  single LLM call per turn</text>
+
+  <!-- router output labels -->
+  <rect x="352" y="292" width="80" height="34" rx="5" fill="#1c1917" stroke="#10b981" stroke-width="1"/>
+  <text x="392" y="307" text-anchor="middle" fill="#6ee7b7" font-size="9" font-weight="600">User Memory</text>
+  <text x="392" y="319" text-anchor="middle" fill="#064e3b" font-size="8">Node → Neo4j</text>
+
+  <rect x="440" y="292" width="80" height="34" rx="5" fill="#1c1917" stroke="#8b5cf6" stroke-width="1"/>
+  <text x="480" y="307" text-anchor="middle" fill="#c4b5fd" font-size="9" font-weight="600">Episodic Node</text>
+  <text x="480" y="319" text-anchor="middle" fill="#4c1d95" font-size="8">→ MongoDB</text>
+
+  <rect x="528" y="292" width="80" height="34" rx="5" fill="#1c1917" stroke="#f59e0b" stroke-width="1"/>
+  <text x="568" y="307" text-anchor="middle" fill="#fcd34d" font-size="9" font-weight="600">UserDB Node</text>
+  <text x="568" y="319" text-anchor="middle" fill="#78350f" font-size="8">→ SQLite users</text>
+
+  <!-- router decision text -->
+  <text x="480" y="350" text-anchor="middle" fill="#6b7280" font-size="9">LLM analyses: trigger_user_memory | trigger_episodic | trigger_user_db</text>
+  <text x="480" y="363" text-anchor="middle" fill="#6b7280" font-size="9">+ extracts memories with canonical_key deduplication</text>
+
+  <!-- Summarizer box left of router -->
+  <rect x="60" y="245" width="268" height="130" rx="8" fill="#111827" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="194" y="267" text-anchor="middle" fill="#fcd34d" font-size="12" font-weight="600">Summarizer  (memory/summarizer.py)</text>
+  <rect x="72" y="277" width="244" height="22" rx="4" fill="#1c1409" stroke="#f59e0b" stroke-width="1"/>
+  <text x="194" y="292" text-anchor="middle" fill="#fbbf24" font-size="9">T6→summarize T1-T3 (L0)  ·  T9→summarize T4-T6 (L0) + compress L0×2→L1</text>
+  <rect x="72" y="304" width="244" height="22" rx="4" fill="#1c1409" stroke="#10b981" stroke-width="1"/>
+  <text x="194" y="319" text-anchor="middle" fill="#6ee7b7" font-size="9">T12→summarize T7-T9  ·  T15→L0 + compress→L1(T7-T12)</text>
+  <text x="194" y="346" text-anchor="middle" fill="#6b7280" font-size="9">Redis (L0 batches + L1 meta-summaries)</text>
+  <text x="194" y="359" text-anchor="middle" fill="#6b7280" font-size="9">MongoDB (episodic narrative when flagged)</text>
+
+  <!-- Context builder right -->
+  <rect x="632" y="245" width="268" height="130" rx="8" fill="#111827" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="766" y="267" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="600">Context Builder  (memory/context_builder.py)</text>
+  <text x="766" y="284" text-anchor="middle" fill="#1e40af" font-size="9">Parallel reads from all stores:</text>
+  <text x="766" y="298" text-anchor="middle" fill="#64748b" font-size="9">Neo4j memories · MongoDB episodic</text>
+  <text x="766" y="312" text-anchor="middle" fill="#64748b" font-size="9">Redis summaries (prefers L1) · SQLite raw turns</text>
+  <text x="766" y="330" text-anchor="middle" fill="#4b5563" font-size="9">Ordered: facts→prefs→goals→constraints</text>
+  <text x="766" y="344" text-anchor="middle" fill="#4b5563" font-size="9">→episodic→summaries→raw window</text>
+
+  <!-- ══════ STORAGE LAYER ══════ -->
+  <text x="480" y="408" text-anchor="middle" fill="#475569" font-size="10">─────────────────────────  Storage Layer  ─────────────────────────</text>
+
+  <!-- Neo4j -->
+  <rect x="30" y="422" width="218" height="195" rx="8" fill="#0a1f12" stroke="#10b981" stroke-width="2"/>
+  <text x="139" y="444" text-anchor="middle" fill="#6ee7b7" font-size="13" font-weight="700">Neo4j</text>
+  <text x="139" y="460" text-anchor="middle" fill="#065f46" font-size="9">Graphiti-style · ALL user memory</text>
+
+  <rect x="42" y="468" width="194" height="24" rx="4" fill="#052e16" stroke="#10b981" stroke-width="1"/>
+  <text x="139" y="484" text-anchor="middle" fill="#6ee7b7" font-size="10">(:UserMemory {memory_type:"fact"})</text>
+  <rect x="42" y="496" width="194" height="24" rx="4" fill="#052e16" stroke="#6366f1" stroke-width="1"/>
+  <text x="139" y="512" text-anchor="middle" fill="#a5b4fc" font-size="10">(:UserMemory {type:"preference"})</text>
+  <rect x="42" y="524" width="194" height="24" rx="4" fill="#052e16" stroke="#f59e0b" stroke-width="1"/>
+  <text x="139" y="540" text-anchor="middle" fill="#fcd34d" font-size="10">(:UserMemory {type:"goal"})</text>
+  <rect x="42" y="552" width="194" height="24" rx="4" fill="#052e16" stroke="#ef4444" stroke-width="1"/>
+  <text x="139" y="568" text-anchor="middle" fill="#fca5a5" font-size="10">(:UserMemory {type:"constraint"})</text>
+  <text x="139" y="592" text-anchor="middle" fill="#064e3b" font-size="8">MERGE on (user_id+type+canonical_key)</text>
+  <text x="139" y="604" text-anchor="middle" fill="#064e3b" font-size="8">deduplicates · higher confidence wins</text>
+
+  <!-- MongoDB -->
+  <rect x="262" y="422" width="218" height="195" rx="8" fill="#150a2e" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="371" y="444" text-anchor="middle" fill="#c4b5fd" font-size="13" font-weight="700">MongoDB</text>
+  <text x="371" y="460" text-anchor="middle" fill="#4c1d95" font-size="9">episodic_memories collection</text>
+  <rect x="274" y="468" width="194" height="118" rx="4" fill="#1e1035" stroke="#8b5cf6" stroke-width="1"/>
+  <text x="371" y="485" text-anchor="middle" fill="#c4b5fd" font-size="9" font-weight="600">EpisodicMemory document</text>
+  <text x="371" y="499" text-anchor="middle" fill="#6b21a8" font-size="8">memory_id, user_id, session_id</text>
+  <text x="371" y="513" text-anchor="middle" fill="#6b21a8" font-size="8">title, content (rich narrative)</text>
+  <text x="371" y="527" text-anchor="middle" fill="#6b21a8" font-size="8">outcome: resolved|ongoing|unclear</text>
+  <text x="371" y="541" text-anchor="middle" fill="#6b21a8" font-size="8">emotional_tone, key_entities</text>
+  <text x="371" y="555" text-anchor="middle" fill="#6b21a8" font-size="8">tags [ ], turn_start, turn_end</text>
+  <text x="371" y="598" text-anchor="middle" fill="#4c1d95" font-size="8">Stored only when router decides</text>
+  <text x="371" y="610" text-anchor="middle" fill="#4c1d95" font-size="8">trigger_episodic = true</text>
+
+  <!-- Redis -->
+  <rect x="494" y="422" width="218" height="195" rx="8" fill="#1c0d04" stroke="#f97316" stroke-width="2"/>
+  <text x="603" y="444" text-anchor="middle" fill="#fdba74" font-size="13" font-weight="700">Redis</text>
+  <text x="603" y="460" text-anchor="middle" fill="#7c2d12" font-size="9">summary:{session_id} sorted set</text>
+  <rect x="506" y="468" width="194" height="52" rx="4" fill="#2c1500" stroke="#f97316" stroke-width="1"/>
+  <text x="603" y="484" text-anchor="middle" fill="#fb923c" font-size="9" font-weight="600">Level-0: Raw batch summaries</text>
+  <text x="603" y="498" text-anchor="middle" fill="#7c2d12" font-size="8">3-turn batches · score=batch_start</text>
+  <text x="603" y="512" text-anchor="middle" fill="#7c2d12" font-size="8">T1-T3, T4-T6, T7-T9 …</text>
+  <rect x="506" y="526" width="194" height="52" rx="4" fill="#2c1500" stroke="#ef4444" stroke-width="1"/>
+  <text x="603" y="542" text-anchor="middle" fill="#fca5a5" font-size="9" font-weight="600">Level-1: Meta-summaries (compressed)</text>
+  <text x="603" y="556" text-anchor="middle" fill="#7f1d1d" font-size="8">merge(S1+S2) → M1 covers T1-T6</text>
+  <text x="603" y="570" text-anchor="middle" fill="#7f1d1d" font-size="8">merge(S3+S4) → M2 covers T7-T12</text>
+  <text x="603" y="598" text-anchor="middle" fill="#7c2d12" font-size="8">Context prefers L1 (fewer tokens)</text>
+  <text x="603" y="610" text-anchor="middle" fill="#7c2d12" font-size="8">fills with uncovered L0s</text>
+
+  <!-- SQLite -->
+  <rect x="726" y="422" width="204" height="195" rx="8" fill="#1a1200" stroke="#eab308" stroke-width="2"/>
+  <text x="828" y="444" text-anchor="middle" fill="#fde047" font-size="13" font-weight="700">SQLite</text>
+  <text x="828" y="460" text-anchor="middle" fill="#713f12" font-size="9">operational data only</text>
+  <rect x="738" y="468" width="180" height="22" rx="4" fill="#2a1e00" stroke="#eab308" stroke-width="1"/>
+  <text x="828" y="483" text-anchor="middle" fill="#fde047" font-size="9">users</text>
+  <rect x="738" y="494" width="180" height="22" rx="4" fill="#2a1e00" stroke="#eab308" stroke-width="1"/>
+  <text x="828" y="509" text-anchor="middle" fill="#fde047" font-size="9">sessions</text>
+  <rect x="738" y="522" width="180" height="22" rx="4" fill="#2a1e00" stroke="#eab308" stroke-width="1"/>
+  <text x="828" y="537" text-anchor="middle" fill="#fde047" font-size="9">turn_logs  (+ router_decision JSON)</text>
+  <text x="828" y="574" text-anchor="middle" fill="#713f12" font-size="8">Sliding window source (last 6 turns)</text>
+  <text x="828" y="586" text-anchor="middle" fill="#713f12" font-size="8">No memory stored here</text>
+
+  <!-- ── Summarization timeline ───────────────────────── -->
+  <rect x="30" y="632" width="900" height="132" rx="8" fill="#111827" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="480" y="654" text-anchor="middle" fill="#fcd34d" font-size="12" font-weight="600">Hierarchical Summarization Timeline</text>
+
+  <!-- Turn boxes row 1 (T1-T9) -->
+  <!-- T1-T3 amber batch -->
+  <rect x="50"  y="666" width="30" height="18" rx="3" fill="#292204" stroke="#f59e0b" stroke-width="1"/>
+  <text x="65"  y="679" text-anchor="middle" fill="#fbbf24" font-size="8">T1</text>
+  <rect x="84"  y="666" width="30" height="18" rx="3" fill="#292204" stroke="#f59e0b" stroke-width="1"/>
+  <text x="99"  y="679" text-anchor="middle" fill="#fbbf24" font-size="8">T2</text>
+  <rect x="118" y="666" width="30" height="18" rx="3" fill="#292204" stroke="#f59e0b" stroke-width="1"/>
+  <text x="133" y="679" text-anchor="middle" fill="#fbbf24" font-size="8">T3</text>
+  <!-- T4-T6 green batch -->
+  <rect x="160" y="666" width="30" height="18" rx="3" fill="#031909" stroke="#10b981" stroke-width="1"/>
+  <text x="175" y="679" text-anchor="middle" fill="#6ee7b7" font-size="8">T4</text>
+  <rect x="194" y="666" width="30" height="18" rx="3" fill="#031909" stroke="#10b981" stroke-width="1"/>
+  <text x="209" y="679" text-anchor="middle" fill="#6ee7b7" font-size="8">T5</text>
+  <rect x="228" y="666" width="30" height="18" rx="3" fill="#031909" stroke="#10b981" stroke-width="1"/>
+  <text x="243" y="679" text-anchor="middle" fill="#6ee7b7" font-size="8">T6</text>
+  <!-- T7-T9 violet batch -->
+  <rect x="270" y="666" width="30" height="18" rx="3" fill="#1a0a38" stroke="#8b5cf6" stroke-width="1"/>
+  <text x="285" y="679" text-anchor="middle" fill="#c4b5fd" font-size="8">T7</text>
+  <rect x="304" y="666" width="30" height="18" rx="3" fill="#1a0a38" stroke="#8b5cf6" stroke-width="1"/>
+  <text x="319" y="679" text-anchor="middle" fill="#c4b5fd" font-size="8">T8</text>
+  <rect x="338" y="666" width="30" height="18" rx="3" fill="#1a0a38" stroke="#8b5cf6" stroke-width="1"/>
+  <text x="353" y="679" text-anchor="middle" fill="#c4b5fd" font-size="8">T9</text>
+  <!-- T10-T12 red batch -->
+  <rect x="380" y="666" width="30" height="18" rx="3" fill="#2a0505" stroke="#ef4444" stroke-width="1"/>
+  <text x="395" y="679" text-anchor="middle" fill="#fca5a5" font-size="8">T10</text>
+  <rect x="414" y="666" width="30" height="18" rx="3" fill="#2a0505" stroke="#ef4444" stroke-width="1"/>
+  <text x="429" y="679" text-anchor="middle" fill="#fca5a5" font-size="8">T11</text>
+  <rect x="448" y="666" width="30" height="18" rx="3" fill="#2a0505" stroke="#ef4444" stroke-width="1"/>
+  <text x="463" y="679" text-anchor="middle" fill="#fca5a5" font-size="8">T12</text>
+  <!-- raw T13-T15 -->
+  <rect x="490" y="666" width="30" height="18" rx="3" fill="#1a1a1a" stroke="#475569" stroke-width="1"/>
+  <text x="505" y="679" text-anchor="middle" fill="#94a3b8" font-size="8">T13</text>
+  <rect x="524" y="666" width="30" height="18" rx="3" fill="#1a1a1a" stroke="#475569" stroke-width="1"/>
+  <text x="539" y="679" text-anchor="middle" fill="#94a3b8" font-size="8">T14</text>
+  <rect x="558" y="666" width="30" height="18" rx="3" fill="#1a1a1a" stroke="#475569" stroke-width="1"/>
+  <text x="573" y="679" text-anchor="middle" fill="#94a3b8" font-size="8">T15</text>
+  <text x="610" y="679" fill="#374151" font-size="9">…</text>
+
+  <!-- annotation row -->
+  <text x="99"  y="700" text-anchor="middle" fill="#f59e0b" font-size="8">↓ T6</text>
+  <text x="99"  y="711" text-anchor="middle" fill="#f59e0b" font-size="8">S1(L0)</text>
+  <text x="209" y="700" text-anchor="middle" fill="#10b981" font-size="8">↓ T9</text>
+  <text x="209" y="711" text-anchor="middle" fill="#10b981" font-size="8">S2(L0)</text>
+  <text x="319" y="700" text-anchor="middle" fill="#8b5cf6" font-size="8">↓ T12</text>
+  <text x="319" y="711" text-anchor="middle" fill="#8b5cf6" font-size="8">S3(L0)</text>
+  <text x="429" y="700" text-anchor="middle" fill="#ef4444" font-size="8">↓ T15</text>
+  <text x="429" y="711" text-anchor="middle" fill="#ef4444" font-size="8">S4(L0)</text>
+
+  <!-- meta annotations -->
+  <text x="154" y="728" text-anchor="middle" fill="#fbbf24" font-size="8">At T9: compress S1+S2 → M1(L1) covers T1-T6</text>
+  <text x="374" y="728" text-anchor="middle" fill="#f97316" font-size="8">At T15: compress S3+S4 → M2(L1) covers T7-T12</text>
+
+  <!-- context window note -->
+  <rect x="640" y="660" width="278" height="96" rx="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1"/>
+  <text x="779" y="677" text-anchor="middle" fill="#93c5fd" font-size="10" font-weight="600">Context window for T13+</text>
+  <text x="655" y="693" fill="#6366f1" font-size="9">[META T1-T6]  M1 (1 token-efficient node)</text>
+  <text x="655" y="708" fill="#6366f1" font-size="9">[META T7-T12] M2 (1 token-efficient node)</text>
+  <text x="655" y="723" fill="#94a3b8" font-size="9">[RAW  T13-T15] uncovered L0 summary</text>
+  <text x="655" y="738" fill="#475569" font-size="9">+ last 6 raw turns (T10-T15 sliding window)</text>
+  <text x="655" y="750" fill="#1e3a5f" font-size="8">= compressed history + fresh context</text>
+
+  <!-- arrow defs -->
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 Z" fill="#334155"/>
+    </marker>
+  </defs>
+</svg>
