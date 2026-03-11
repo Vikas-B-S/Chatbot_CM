@@ -1,22 +1,31 @@
 """
-memory/summarizer.py
-Hierarchical summarization pipeline — triggered after every turn.
+memory/summarizer.py — 3-level hierarchical summarization pipeline
 
-Trigger logic:
-  Turn 6  → summarize turns 1-3   → Redis L0 (S1)
-  Turn 9  → summarize turns 4-6   → Redis L0 (S2)
-              compress S1 + S2     → Redis L1 (M1, covers T1-T6)
-  Turn 12 → summarize turns 7-9   → Redis L0 (S3)
-  Turn 15 → summarize turns 10-12 → Redis L0 (S4)
-              compress S3 + S4     → Redis L1 (M2, covers T7-T12)
+Trigger schedule (with default batch=3, summarize_at=6):
+  Turn 6  → summarize T1-T3  → L0 S1
+  Turn 9  → summarize T4-T6  → L0 S2
+  Turn 12 → summarize T7-T9  → L0 S3
+              3 L0s uncompressed → compress S1+S2+S3 → L1 M1 (covers T1-T9)
+  Turn 15 → summarize T10-T12 → L0 S4
+  Turn 18 → summarize T13-T15 → L0 S5
+  Turn 21 → summarize T16-T18 → L0 S6
+              3 L0s (S4+S5+S6) uncompressed → compress → L1 M2 (covers T10-T18)
+  Turn 24 → summarize T19-T21 → L0 S7
+  Turn 27 → summarize T22-T24 → L0 S8
+  Turn 30 → summarize T25-T27 → L0 S9
+              3 L0s (S7+S8+S9) uncompressed → compress → L1 M3 (covers T19-T27)
+              3 L1s (M1+M2+M3) uncompressed → compress → L2 A1 (covers T1-T27)
+              L2 A1 → write handoff summary for next session
 
-Note: should_summarize() is a plain (non-async) function in context_builder.
-      Do NOT await it — it does no I/O.
+  Pattern: L0 every 3 turns | L1 every 9 turns | L2 every 27 turns | Handoff with L2
 """
 from db import sqlite_manager as sql
 from db import redis_manager as redis_mgr
 from db import mongo_manager as mongo
-from memory.extractor import summarize_turns, compress_summaries, create_episodic_narrative
+from memory.extractor import (
+    summarize_turns, compress_summaries, compress_to_arc,
+    create_episodic_narrative, create_handoff_summary
+)
 from memory.context_builder import should_summarize
 
 
@@ -24,15 +33,16 @@ async def check_and_run_summarization(
     session_id: str,
     user_id: str,
     turn_number: int,
-    episodic_decision: dict = None
+    episodic_decision: dict = None,
 ) -> dict | None:
     """
-    Called after every turn. Runs summarization + meta-compression if triggered.
-    Returns result dict or None if not a summarization turn.
-
-    should_summarize() is a pure function — call it directly, no await.
+    Called after every turn. Full pipeline:
+      A. L0 batch summary (if batch boundary)
+      B. L1 compression (if 3 uncompressed L0s exist)
+      C. L2 arc compression (if 3 uncompressed L1s exist)
+      D. Handoff summary (if L2 was just created)
+      E. Episodic narrative (if router flagged this batch)
     """
-    # Pure function — no await needed
     do_summarize, batch_start, batch_end = should_summarize(turn_number)
     if not do_summarize:
         return None
@@ -44,40 +54,44 @@ async def check_and_run_summarization(
     actual_start = turns[0]["turn_number"]
     actual_end   = turns[-1]["turn_number"]
 
-    # ── A: Summarise batch → Redis L0 ────────────────────────
-    result       = await summarize_turns(turns)
-    summary_text = result["summary"]
-    key_topics   = result["key_topics"]
-
-    new_id = await redis_mgr.save_summary(
-        session_id=session_id,
-        user_id=user_id,
-        batch_start=actual_start,
-        batch_end=actual_end,
-        summary_text=summary_text,
-        key_topics=key_topics,
+    # ── A: L0 batch summary ───────────────────────────────────
+    result     = await summarize_turns(turns)
+    l0_id      = await redis_mgr.save_summary(
+        session_id=session_id, user_id=user_id,
+        batch_start=actual_start, batch_end=actual_end,
+        summary_text=result["summary"], key_topics=result["key_topics"],
         level=0
     )
     await sql.mark_turns_summarized(session_id, actual_start, actual_end)
 
-    # ── B: Meta-compression → Redis L1 ───────────────────────
-    meta = await _maybe_compress_meta(session_id, user_id)
+    # ── B: L1 compression ────────────────────────────────────
+    l1_result = await _maybe_compress(session_id, user_id, level=0, target_level=1)
 
-    # ── C: Episodic narrative for this batch → MongoDB ────────
+    # ── C: L2 arc compression ─────────────────────────────────
+    l2_result = None
+    if l1_result:
+        l2_result = await _maybe_compress(session_id, user_id, level=1, target_level=2)
+
+    # ── D: Handoff summary (written when L2 is created) ───────
+    handoff_result = None
+    if l2_result:
+        handoff_result = await _write_handoff(session_id, user_id)
+
+    # ── E: Episodic narrative for this batch ──────────────────
     episodic_stored = None
     if episodic_decision and episodic_decision.get("should_store"):
         narrative = await create_episodic_narrative(turns, episodic_decision)
         ep_id = await mongo.store_episodic_memory(
-            user_id=user_id,
-            session_id=session_id,
-            title=narrative["title"],
-            content=narrative["content"],
+            user_id=user_id, session_id=session_id,
+            title=narrative["title"], content=narrative["content"],
             outcome=narrative["outcome"],
-            turn_start=actual_start,
-            turn_end=actual_end,
+            turn_start=actual_start, turn_end=actual_end,
             key_entities=episodic_decision.get("key_entities", []),
             emotional_tone=episodic_decision.get("emotional_tone", "neutral"),
-            tags=episodic_decision.get("tags", [])
+            emotional_intensity=episodic_decision.get("emotional_intensity", 2),
+            tags=episodic_decision.get("tags", []),
+            topic_cluster=narrative.get("topic_cluster", "general"),
+            importance_score=narrative.get("importance_score", 5.0),
         )
         episodic_stored = {"memory_id": ep_id, "title": narrative["title"]}
 
@@ -85,45 +99,82 @@ async def check_and_run_summarization(
         "summarized":    True,
         "batch_start":   actual_start,
         "batch_end":     actual_end,
-        "summary_id":    new_id,
-        "summary_text":  summary_text,
-        "key_topics":    key_topics,
-        "meta_compression": meta,
-        "episodic_stored":  episodic_stored
+        "l0_id":         l0_id,
+        "l1":            l1_result,
+        "l2":            l2_result,
+        "handoff":       handoff_result,
+        "episodic":      episodic_stored,
     }
 
 
-async def _maybe_compress_meta(session_id: str, user_id: str) -> dict | None:
+async def _maybe_compress(
+    session_id: str,
+    user_id: str,
+    level: int,
+    target_level: int
+) -> dict | None:
     """
-    If there are exactly 2 uncompressed L0 summaries → merge into L1.
+    Compress `_COMPRESS_AT` summaries at `level` into one summary at `target_level`.
+    Returns result dict or None if not enough uncompressed summaries exist.
     """
-    pair = await redis_mgr.get_oldest_two_uncompressed_level0(session_id)
-    if len(pair) < 2:
+    candidates = await redis_mgr.get_uncompressed_at_level(session_id, level)
+    if len(candidates) < redis_mgr._COMPRESS_AT:
         return None
 
-    s_a, s_b = pair[0], pair[1]
-    meta = await compress_summaries(s_a, s_b)
-    if not meta.get("meta_summary"):
+    # Take the oldest _COMPRESS_AT uncompressed summaries
+    batch = sorted(candidates, key=lambda s: s["batch_start"])[:redis_mgr._COMPRESS_AT]
+
+    if target_level == 1:
+        # L0→L1: standard 3-batch compression
+        compressed = await compress_summaries(batch)
+    else:
+        # L1→L2: arc-level compression (broader narrative)
+        compressed = await compress_to_arc(batch)
+
+    if not compressed.get("summary"):
         return None
 
-    meta_text = meta["meta_summary"]
-    if meta.get("evolution_note"):
-        meta_text += f" {meta['evolution_note']}"
-
-    meta_id = await redis_mgr.save_summary(
-        session_id=session_id,
-        user_id=user_id,
-        batch_start=s_a["batch_start"],
-        batch_end=s_b["batch_end"],
-        summary_text=meta_text,
-        key_topics=meta.get("key_topics", []),
-        level=1,
-        source_summary_ids=[s_a["summary_id"], s_b["summary_id"]]
+    new_id = await redis_mgr.save_summary(
+        session_id=session_id, user_id=user_id,
+        batch_start=batch[0]["batch_start"],
+        batch_end=batch[-1]["batch_end"],
+        summary_text=compressed["summary"],
+        key_topics=compressed.get("key_topics", []),
+        level=target_level,
+        source_summary_ids=[s["summary_id"] for s in batch],
     )
 
+    label = f"L{target_level}"
+    print(f"  ↳ {label} compressed: T{batch[0]['batch_start']}-T{batch[-1]['batch_end']}")
     return {
-        "meta_id":          meta_id,
-        "covers":           f"T{s_a['batch_start']}-T{s_b['batch_end']}",
-        "compressed_from":  [s_a["summary_id"], s_b["summary_id"]],
-        "meta_text":        meta_text
+        "summary_id":  new_id,
+        "level":       target_level,
+        "covers":      f"T{batch[0]['batch_start']}-T{batch[-1]['batch_end']}",
+        "from_count":  len(batch),
+        "summary":     compressed["summary"][:120] + "...",
     }
+
+
+async def _write_handoff(session_id: str, user_id: str) -> dict | None:
+    """
+    Generate and store the cross-session handoff summary.
+    Called whenever an L2 is created — gives the next session a solid starting point.
+    """
+    # Get the best summary to base the handoff on
+    best = await redis_mgr.get_best_session_summary(session_id)
+    if not best:
+        return None
+
+    handoff = await create_handoff_summary(best)
+    if not handoff.get("summary"):
+        return None
+
+    await redis_mgr.save_handoff_summary(
+        user_id=user_id,
+        summary_text=handoff["summary"],
+        key_topics=handoff.get("key_topics", []),
+        session_id=session_id,
+    )
+
+    print(f"  ↳ Handoff written for user {user_id[:12]}...")
+    return {"written": True, "summary": handoff["summary"][:100] + "..."}

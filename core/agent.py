@@ -165,7 +165,10 @@ async def chat(
                 turn_end=turn_number,
                 key_entities=decision.episodic.key_entities,
                 emotional_tone=decision.episodic.emotional_tone,
-                tags=decision.episodic.tags
+                emotional_intensity=getattr(decision.episodic, "emotional_intensity", 2),
+                tags=decision.episodic.tags,
+                topic_cluster=narrative.get("topic_cluster", "general"),
+                importance_score=narrative.get("importance_score", 5.0),
             )
             episodic_stored = {"memory_id": ep_id, "title": narrative["title"]}
 

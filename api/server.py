@@ -30,6 +30,7 @@ Misc:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -155,8 +156,14 @@ async def signup(req: SignupReq):
     Create a new account. Email must be unique. Username is display name.
     Automatically creates the first session.
     """
-    if not req.password or len(req.password) < 6:
-        raise HTTPException(400, "Password must be at least 6 characters.")
+    pw = req.password or ""
+    pw_errors = []
+    if len(pw) < 8:                          pw_errors.append("at least 8 characters")
+    if not re.search(r"[A-Z]", pw):          pw_errors.append("one uppercase letter")
+    if not re.search(r"[0-9]", pw):          pw_errors.append("one number")
+    if not re.search(r"[^A-Za-z0-9]", pw):  pw_errors.append("one special character")
+    if pw_errors:
+        raise HTTPException(400, "Password must contain: " + ", ".join(pw_errors) + ".")
     if await sql.get_user_by_email(req.email):
         raise HTTPException(400, f"An account with email '{req.email}' already exists. Use /auth/login instead.")
     if await sql.get_user_by_username(req.username):
@@ -193,6 +200,9 @@ async def login(req: LoginReq):
         raise HTTPException(401, "Incorrect password.")
     # Strip password_hash before returning
     user = {k: v for k, v in user.items() if k != "password_hash"}
+
+    # Warm username cache so Graphiti frames future episodes with real name
+    neo4j._username_cache[user["user_id"]] = user["username"]
 
     # Create a new session for this login
     existing = await sql.get_user_sessions(user["user_id"])
@@ -258,6 +268,20 @@ async def get_memory_history(
     except Exception as e:
         raise HTTPException(503, f"Graphiti/Neo4j unavailable: {e}")
 
+
+
+
+@app.get("/users/{user_id}/memory/timeline")
+async def memory_timeline(user_id: str, key: str):
+    """
+    Structured timeline for a single canonical_key.
+    Shows every version: active/inactive, when it changed, reactivations.
+
+    Example: GET /users/{id}/memory/timeline?key=coding_language
+    Returns: Python(v1 inactive) → C++(v2 inactive) → Python(v3 active, reactivated)
+    """
+    timeline = await neo4j.get_memory_timeline(user_id, key)
+    return timeline
 
 @app.get("/users/{user_id}/episodic")
 async def get_user_episodic(user_id: str, limit: int = 10):
@@ -327,6 +351,135 @@ async def get_session_context(session_id: str):
 
 
 # ─── Chat ─────────────────────────────────────────────────────
+
+
+
+# ─── Delete user ──────────────────────────────────────────────
+
+
+
+@app.delete("/users/{user_id}/credentials", status_code=200)
+async def delete_credentials(user_id: str):
+    """
+    Wipe login credentials (email + password) only.
+    All memory, sessions, and conversation history are preserved.
+    """
+    user = await sql.get_user(user_id)
+    if not user:
+        raise HTTPException(404, "User not found.")
+    await sql.delete_user_credentials(user_id)
+    return {
+        "user_id": user_id,
+        "username": user["username"],
+        "status": "credentials removed — memory and sessions preserved"
+    }
+
+@app.delete("/users/{user_id}", status_code=200)
+async def delete_user(user_id: str):
+    """
+    Hard delete a user and ALL their data across every store:
+      - SQLite : user row, all sessions, all turn logs
+      - Neo4j  : entire Graphiti group (all episodes, entities, edges)
+      - MongoDB: all episodic memories
+      - Redis  : all summary keys for all sessions
+
+    This is irreversible.
+    """
+    # Verify user exists first
+    user = await sql.get_user(user_id)
+    if not user:
+        raise HTTPException(404, "User not found.")
+
+    errors = []
+    results = {}
+
+    # ── 1. SQLite — sessions + turns + user row ───────────────
+    try:
+        sessions = await sql.get_user_sessions(user_id)
+        session_ids = [s["session_id"] for s in sessions]
+        deleted_counts = await sql.delete_user_data(user_id)
+        results["sqlite"] = deleted_counts
+    except Exception as e:
+        errors.append(f"SQLite: {e}")
+        session_ids = []
+
+    # ── 2. Neo4j / Graphiti ───────────────────────────────────
+    try:
+        await neo4j.delete_user_graph(user_id)
+        results["neo4j"] = "deleted"
+    except Exception as e:
+        errors.append(f"Neo4j: {e}")
+        results["neo4j"] = f"error: {e}"
+
+    # ── 3. MongoDB — episodic memories ───────────────────────
+    try:
+        count = await mongo.delete_user_episodic_memories(user_id)
+        results["mongodb"] = f"{count} episodes deleted"
+    except Exception as e:
+        errors.append(f"MongoDB: {e}")
+        results["mongodb"] = f"error: {e}"
+
+    # ── 4. Redis — all session summaries ─────────────────────
+    try:
+        count = await redis_mgr.delete_user_summaries(session_ids, user_id=user_id)
+        results["redis"] = f"{count} keys deleted"
+    except Exception as e:
+        errors.append(f"Redis: {e}")
+        results["redis"] = f"error: {e}"
+
+    # Clean username cache
+    neo4j._username_cache.pop(user_id, None)
+
+    return {
+        "deleted_user_id": user_id,
+        "username":        user["username"],
+        "results":         results,
+        "errors":          errors,
+        "status":          "complete" if not errors else "partial"
+    }
+
+
+@app.get("/users/{user_id}/episodic/stats")
+async def episodic_stats(user_id: str):
+    """Usage stats: cluster distribution, access counts, ongoing episodes."""
+    return await mongo.get_episodic_stats(user_id)
+
+
+@app.get("/users/{user_id}/episodic/ongoing")
+async def ongoing_episodes(user_id: str):
+    """All unresolved ongoing episodes — open threads."""
+    return await mongo.get_ongoing_episodes(user_id)
+
+
+@app.get("/users/{user_id}/episodic/important")
+async def important_episodes(user_id: str, min_importance: float = 7.0):
+    """High-importance episodes — always surface regardless of recency."""
+    return await mongo.get_high_importance_episodes(user_id, min_importance)
+
+
+@app.get("/users/{user_id}/episodic/cluster/{cluster}")
+async def episodes_by_cluster(user_id: str, cluster: str):
+    """All episodes in a topic cluster (career, health, learning, etc.)."""
+    return await mongo.get_episodes_by_cluster(user_id, cluster)
+
+
+@app.post("/users/{user_id}/episodic/{memory_id}/outcome")
+async def update_outcome(user_id: str, memory_id: str, outcome: str, note: str = "", boost: float = 0.0):
+    """Update episode outcome when it resolves. outcome: resolved|ongoing|abandoned."""
+    updated = await mongo.update_episode_outcome(memory_id, outcome, note, boost)
+    return {"updated": updated, "memory_id": memory_id, "new_outcome": outcome}
+
+
+@app.post("/users/{user_id}/episodic/consolidate")
+async def consolidate(user_id: str, older_than_days: int = 90, dry_run: bool = False):
+    """
+    Merge low-value old episodes into cluster summaries.
+    Use dry_run=true to preview what would be consolidated without writing.
+    """
+    result = await mongo.consolidate_old_episodes(
+        user_id, older_than_days=older_than_days, dry_run=dry_run
+    )
+    return result
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatReq) -> ChatResp:

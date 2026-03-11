@@ -63,8 +63,8 @@ async def build_context(
     results = await asyncio.gather(
         neo4j.get_user_memories(user_id, query=user_message or None),
         mongo.get_user_episodic_memories(user_id, limit=3, session_id=session_id, query=user_message or None),
-        redis_mgr.get_latest_summaries_for_context(session_id),
-        sql.get_last_n_turns(session_id, n=settings.max_raw_turns),
+        redis_mgr.get_latest_summaries_for_context(session_id, user_id=user_id, query=user_message or None),
+        sql.get_turns_from_last_summary(session_id),
         return_exceptions=True
     )
 
@@ -122,17 +122,26 @@ def format_context_for_prompt(context: dict) -> str:
     # ── 3. Conversation history summaries from Redis ───────────
     summaries = context.get("summaries", [])
     if summaries:
-        parts.append("\n## Conversation History")
         for s in summaries:
-            label = "Meta" if s.get("level", 0) >= 1 else "Summary"
-            parts.append(
-                f"[{label} T{s['batch_start']}-T{s['batch_end']}]: {s['summary_text']}"
-            )
+            level = s.get("level", 0)
+            if level == 99:
+                # Cross-session handoff — render prominently at top of history
+                parts.append("\n## Previous Session")
+                parts.append(s["summary_text"])
+            elif level == 2:
+                parts.append("\n## Session Arc")
+                parts.append(f"[T{s['batch_start']}-T{s['batch_end']}]: {s['summary_text']}")
+            elif level == 1:
+                parts.append("\n## Conversation Window")
+                parts.append(f"[T{s['batch_start']}-T{s['batch_end']}]: {s['summary_text']}")
+            else:
+                parts.append("\n## Recent Summary")
+                parts.append(f"[T{s['batch_start']}-T{s['batch_end']}]: {s['summary_text']}")
 
     # ── 4. Last N raw turns from SQLite ───────────────────────
     raw = context.get("raw_turns", [])
     if raw:
-        parts.append(f"\n## Recent Conversation (last {len(raw)} turns)")
+        parts.append(f"\n## Recent Conversation (turns {raw[0]['turn_number']}-{raw[-1]['turn_number']})")
         for t in raw:
             parts.append(f"User: {t['user_msg']}")
             parts.append(f"Assistant: {t['assistant_msg']}")

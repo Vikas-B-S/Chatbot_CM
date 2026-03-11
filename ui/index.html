@@ -635,25 +635,45 @@ header {
 
 * { scrollbar-width: thin; scrollbar-color: var(--border2) transparent; }
 
-.password-strength{
-  font-family: var(--font-mono);
-  font-size: 9px;
-  margin-top:6px;
-  letter-spacing:0.08em;
-  color:var(--text3);
-}
+    /* ── Password strength ───────────────────────── */
+    .pw-rules {
+      margin-top: 6px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 3px 12px;
+    }
+    .pw-rule {
+      font-size: 11px;
+      color: var(--text-dim, #666);
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: color 0.2s;
+    }
+    .pw-rule::before {
+      content: "○";
+      font-size: 10px;
+    }
+    .pw-rule.pass {
+      color: #4caf82;
+    }
+    .pw-rule.pass::before {
+      content: "●";
+    }
+    .pw-strength-bar {
+      height: 3px;
+      border-radius: 2px;
+      margin-top: 8px;
+      background: #333;
+      overflow: hidden;
+    }
+    .pw-strength-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 2px;
+      transition: width 0.3s, background 0.3s;
+    }
 
-.password-strength.weak{
-  color:var(--red);
-}
-
-.password-strength.medium{
-  color:var(--amber);
-}
-
-.password-strength.strong{
-  color:var(--green);
-}
 </style>
 </head>
 <body>
@@ -701,20 +721,15 @@ header {
         <div class="field-hint">// used as your display name across all sessions</div>
       </div>
       <div class="auth-field">
-
-      <label>Password</label>
-
-      <input
-      type="password"
-      id="signup-password"
-      placeholder="8+ chars, 1 uppercase, 1 lowercase, 1 special"
-      autocomplete="new-password"
-      />
-
-      <div id="password-strength" class="password-strength">
-      strength: —
-      </div>
-
+        <label>Password</label>
+        <input type="password" id="signup-password" placeholder="min 8 characters" autocomplete="new-password" oninput="checkPwStrength(this.value)"/>
+        <div class="pw-strength-bar"><div class="pw-strength-fill" id="pw-strength-fill"></div></div>
+        <div class="pw-rules">
+          <span class="pw-rule" id="rule-len">8+ characters</span>
+          <span class="pw-rule" id="rule-upper">1 uppercase</span>
+          <span class="pw-rule" id="rule-num">1 number</span>
+          <span class="pw-rule" id="rule-special">1 special char</span>
+        </div>
       </div>
       <button class="btn-primary" id="btn-signup" onclick="doSignup()">Create Account →</button>
       <div class="auth-error" id="signup-error"></div>
@@ -887,44 +902,49 @@ function showError(id, msg) {
   el.style.display = 'block';
 }
 
-const passwordInput = document.getElementById("signup-password");
-const strengthText = document.getElementById("password-strength");
-
-if(passwordInput){
-
-passwordInput.addEventListener("input", () => {
-
-  const val = passwordInput.value;
-
-  let score = 0;
-
-  if(val.length >= 8) score++;
-  if(/[A-Z]/.test(val)) score++;
-  if(/[a-z]/.test(val)) score++;
-  if(/[^A-Za-z0-9]/.test(val)) score++;
-
-  strengthText.className = "password-strength";
-
-  if(score <= 1){
-    strengthText.textContent = "strength: weak";
-    strengthText.classList.add("weak");
-  }
-  else if(score === 2 || score === 3){
-    strengthText.textContent = "strength: medium";
-    strengthText.classList.add("medium");
-  }
-  else{
-    strengthText.textContent = "strength: strong";
-    strengthText.classList.add("strong");
-  }
-
-});
-
-}
-
 // ── Enter key on auth fields ───────────────────────────────
 document.getElementById('signin-email').addEventListener('keydown', e => { if (e.key === 'Enter') doSignin(); });
 document.getElementById('signup-name').addEventListener('keydown',  e => { if (e.key === 'Enter') doSignup(); });
+
+
+// ── Password strength checker ──────────────────────────────
+function checkPwStrength(pw) {
+  const rules = {
+    'rule-len':     pw.length >= 8,
+    'rule-upper':   /[A-Z]/.test(pw),
+    'rule-num':     /[0-9]/.test(pw),
+    'rule-special': /[^A-Za-z0-9]/.test(pw),
+  };
+  let score = 0;
+  for (const [id, pass] of Object.entries(rules)) {
+    const el = document.getElementById(id);
+    if (el) { el.classList.toggle('pass', pass); }
+    if (pass) score++;
+  }
+  const fill = document.getElementById('pw-strength-fill');
+  if (fill) {
+    const pct = (score / 4) * 100;
+    fill.style.width = pct + '%';
+    fill.style.background = score <= 1 ? '#e74c3c'
+                          : score === 2 ? '#e67e22'
+                          : score === 3 ? '#f1c40f'
+                          : '#4caf82';
+  }
+  return score === 4;
+}
+
+function validatePassword(pw, errorId) {
+  const errors = [];
+  if (pw.length < 8)          errors.push("at least 8 characters");
+  if (!/[A-Z]/.test(pw))     errors.push("one uppercase letter");
+  if (!/[0-9]/.test(pw))     errors.push("one number");
+  if (!/[^A-Za-z0-9]/.test(pw)) errors.push("one special character");
+  if (errors.length) {
+    showError(errorId, "Password needs: " + errors.join(", "));
+    return false;
+  }
+  return true;
+}
 
 // ── Sign In ────────────────────────────────────────────────
 async function doSignin() {
@@ -955,67 +975,33 @@ async function doSignin() {
 
 // ── Sign Up ────────────────────────────────────────────────
 async function doSignup() {
-
-  const email = document.getElementById('signup-email').value.trim();
-  const name  = document.getElementById('signup-name').value.trim();
+  const email    = document.getElementById('signup-email').value.trim();
+  const name     = document.getElementById('signup-name').value.trim();
   const password = document.getElementById('signup-password').value;
-
   API = document.getElementById('api-url-input').value.trim().replace(/\/$/, '');
 
-  if (!email)
-    return showError('signup-error', 'email is required');
-
-  if (!name)
-    return showError('signup-error', 'preferred name is required');
-
-  if (!password)
-    return showError('signup-error', 'password is required');
-
-  const strongPassword =
-    /^(?=.*[a-z])(?=.*[A-Z])(?=.*[^A-Za-z0-9]).{8,}$/;
-
-  if (!strongPassword.test(password))
-    return showError(
-      'signup-error',
-      'password must be 8+ chars with 1 uppercase, 1 lowercase, and 1 special character'
-    );
+  if (!email) return showError('signup-error', 'email is required');
+  if (!name)  return showError('signup-error', 'preferred name is required');
+  if (!validatePassword(password, 'signup-error')) return;
 
   const btn = document.getElementById('btn-signup');
-  btn.disabled = true;
-  btn.textContent = 'creating account…';
+  btn.disabled = true; btn.textContent = 'creating account…';
 
   try {
-
     const res = await fetch(`${API}/auth/signup`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        email,
-        username: name,
-        password
-      })
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ email, username: name, password })
     });
-
     const data = await res.json();
-
-    if (!res.ok)
-      throw new Error(data.detail || 'signup failed');
+    if (!res.ok) throw new Error(data.detail || 'signup failed');
 
     allSessions = [];
-
     initApp(data.user, data.session);
-
     showToast('welcome to Synapse, ' + name + '!');
-
   } catch(e) {
-
     showError('signup-error', e.message);
-
-    btn.disabled = false;
-    btn.textContent = 'Create Account →';
-
+    btn.disabled = false; btn.textContent = 'Create Account →';
   }
-
 }
 
 // ── Init App ───────────────────────────────────────────────

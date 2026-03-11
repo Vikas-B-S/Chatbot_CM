@@ -79,51 +79,146 @@ async def summarize_turns(turns: list[dict]) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 2. META-COMPRESSION → Redis level=1
+# 2. L1 COMPRESSION — 3 L0s → 1 L1 (covers 9 turns)
 # ═══════════════════════════════════════════════════════════════
 
-META_COMPRESSION_SYSTEM = """You merge two sequential conversation summaries into a single meta-summary.
+L1_COMPRESSION_SYSTEM = """You compress 3 sequential conversation summaries into one concise window summary.
 
 Rules:
-- Merge overlapping themes, preserve critical decisions and user facts
-- Describe how the conversation evolved between the two windows
-- Be MORE compressed than either source (3-4 sentences total)
-- Third person
+- Merge overlapping themes, preserve key decisions and user facts revealed
+- Be MORE compressed than any source — 3-4 sentences total
+- Third person. Capture: main topics, user context revealed, decisions made, open threads.
 
 Return ONLY JSON (no markdown):
 {
-  "meta_summary": "Compressed 3-4 sentence meta-summary...",
-  "key_topics": ["merged", "topics"],
-  "evolution_note": "One sentence on how conversation evolved across the two windows"
+  "summary": "Compressed 3-4 sentence window summary...",
+  "key_topics": ["topic1", "topic2"]
 }"""
 
 
-async def compress_summaries(summary_a: dict, summary_b: dict) -> dict:
+async def compress_summaries(summaries: list[dict]) -> dict:
     """
-    Compress two level-0 summaries into one level-1 meta-summary.
-    summary_a = earlier window, summary_b = later window.
+    Compress a list of L0 summaries into one L1 summary.
+    Accepts a list (replaces old 2-arg signature).
     """
     client = get_client()
-    prompt = (
-        f"Summary A (turns {summary_a['batch_start']}-{summary_a['batch_end']}):\n"
-        f"{summary_a['summary_text']}\n\n"
-        f"Summary B (turns {summary_b['batch_start']}-{summary_b['batch_end']}):\n"
-        f"{summary_b['summary_text']}\n\n"
-        "Compress into one meta-summary."
-    )
+    parts = []
+    for s in summaries:
+        parts.append(
+            f"[T{s['batch_start']}-T{s['batch_end']}]: {s['summary_text']}"
+        )
+    prompt = "Compress these sequential summaries into one:\n\n" + "\n\n".join(parts)
+
     response = await client.chat.completions.create(
         model=settings.claude_model,
         max_tokens=250,
         messages=[
-            {"role": "system", "content": META_COMPRESSION_SYSTEM},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": L1_COMPRESSION_SYSTEM},
+            {"role": "user",   "content": prompt}
         ]
     )
     result = _parse_json(response.choices[0].message.content)
     return {
-        "meta_summary": result.get("meta_summary", ""),
+        "summary":    result.get("summary", ""),
         "key_topics": result.get("key_topics", []),
-        "evolution_note": result.get("evolution_note", "")
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. L2 ARC COMPRESSION — 3 L1s → 1 L2 (covers 27 turns)
+# ═══════════════════════════════════════════════════════════════
+
+ARC_COMPRESSION_SYSTEM = """You compress 3 conversation window summaries into one high-level session arc.
+
+This arc covers a large portion of a session. Your job is to capture:
+- The main themes and how they evolved
+- The most important facts revealed about the user
+- Key decisions, outcomes, and open threads
+- The emotional/motivational arc of the conversation
+
+Be highly compressed — 4-5 sentences max. Write in third person.
+
+Return ONLY JSON (no markdown):
+{
+  "summary": "High-level arc summary, 4-5 sentences...",
+  "key_topics": ["main themes"],
+  "key_facts": ["important user facts revealed in this arc"]
+}"""
+
+
+async def compress_to_arc(summaries: list[dict]) -> dict:
+    """
+    Compress L1 summaries into one L2 arc summary.
+    Higher level of abstraction — captures the arc, not the details.
+    """
+    client = get_client()
+    parts = []
+    for s in summaries:
+        topics = ", ".join(s.get("key_topics", []))
+        parts.append(
+            f"[T{s['batch_start']}-T{s['batch_end']} | topics: {topics}]:\n{s['summary_text']}"
+        )
+    prompt = "Compress into one high-level session arc:\n\n" + "\n\n".join(parts)
+
+    response = await client.chat.completions.create(
+        model=settings.claude_model,
+        max_tokens=300,
+        messages=[
+            {"role": "system", "content": ARC_COMPRESSION_SYSTEM},
+            {"role": "user",   "content": prompt}
+        ]
+    )
+    result = _parse_json(response.choices[0].message.content)
+    return {
+        "summary":    result.get("summary", ""),
+        "key_topics": result.get("key_topics", []),
+        "key_facts":  result.get("key_facts", []),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. CROSS-SESSION HANDOFF — "what happened last time"
+# ═══════════════════════════════════════════════════════════════
+
+HANDOFF_SYSTEM = """You write a cross-session handoff summary for an AI assistant.
+This will be shown at the START of the user's NEXT conversation session.
+
+Write in second person ("Last time we talked...").
+Cover: what was discussed, what was decided or resolved, any open threads,
+and anything the AI should follow up on proactively.
+Max 3 sentences. Be warm and specific.
+
+Return ONLY JSON (no markdown):
+{
+  "summary": "Last time we talked, you were... We also discussed... You mentioned wanting to...",
+  "key_topics": ["topic1", "topic2"]
+}"""
+
+
+async def create_handoff_summary(best_summary: dict) -> dict:
+    """
+    Turn the best available session summary into a cross-session handoff.
+    Written in second person — shown at top of next session.
+    """
+    client = get_client()
+    prompt = (
+        f"Session summary (turns {best_summary['batch_start']}-{best_summary['batch_end']}):\n"
+        f"{best_summary['summary_text']}\n\n"
+        f"Key topics: {', '.join(best_summary.get('key_topics', []))}\n\n"
+        "Write a handoff for the next session."
+    )
+    response = await client.chat.completions.create(
+        model=settings.claude_model,
+        max_tokens=200,
+        messages=[
+            {"role": "system", "content": HANDOFF_SYSTEM},
+            {"role": "user",   "content": prompt}
+        ]
+    )
+    result = _parse_json(response.choices[0].message.content)
+    return {
+        "summary":    result.get("summary", ""),
+        "key_topics": result.get("key_topics", []),
     }
 
 
@@ -141,7 +236,11 @@ Return ONLY JSON (no markdown):
 {
   "title": "Short evocative title, max 8 words",
   "content": "Rich 4-6 sentence narrative. Be specific — name the tools, concepts, decisions involved.",
-  "outcome": "resolved|ongoing|abandoned|unclear"
+  "outcome": "resolved|ongoing|abandoned|unclear",
+  "importance_score": <float 1.0-10.0 — how significant is this for understanding the user?
+    1-3: trivial small talk | 4-6: useful context | 7-8: significant event | 9-10: pivotal/life-changing>,
+  "emotional_intensity": <int 1-5 — 1=neutral, 3=moderate, 5=very strong emotion>,
+  "topic_cluster": "<one of: career|health|learning|finance|project|relationship|travel|personal|general>"
 }"""
 
 
@@ -172,7 +271,10 @@ async def create_episodic_narrative(
     )
     result = _parse_json(response.choices[0].message.content)
     return {
-        "title": result.get("title", "Conversation episode"),
-        "content": result.get("content", text[:400]),
-        "outcome": result.get("outcome", "unclear")
+        "title":              result.get("title", "Conversation episode"),
+        "content":            result.get("content", text[:400]),
+        "outcome":            result.get("outcome", "unclear"),
+        "importance_score":   float(result.get("importance_score", 5.0)),
+        "emotional_intensity": int(result.get("emotional_intensity", 2)),
+        "topic_cluster":      result.get("topic_cluster", "general"),
     }
