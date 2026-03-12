@@ -121,20 +121,24 @@ async def chat(user_id: str, session_id: str, user_message: str) -> dict:
 async def chat_stream(user_id: str, session_id: str, user_message: str):
     """
     Streaming version — yields tokens as they arrive from the LLM.
-    User sees first token in ~300ms.
-    Storage fires in background after stream completes.
-
-    Yields:
-      {"token": "..."} for each token
-      {"done": True, "context_used": {...}} at end
+    Timing is logged to server console so latency is visible.
     """
+    import time
+    t0 = time.monotonic()
 
     # ── 1. Build context ──────────────────────────────────────
     context     = await build_context(session_id, user_id, user_message)
     context_str = format_context_for_prompt(context)
+    t_ctx = time.monotonic()
+    print(f"  ⏱ context_build: {(t_ctx-t0)*1000:.0f}ms  "
+          f"[neo4j={len(context.get('memories',[]))} "
+          f"mongo={len(context.get('episodic_memories',[]))} "
+          f"redis={len(context.get('summaries',[]))} "
+          f"sqlite={len(context.get('raw_turns',[]))}]")
 
     # ── 2. Stream LLM response ────────────────────────────────
-    full_response = ""
+    full_response  = ""
+    first_token_at = None
     stream = await _client.chat.completions.create(
         model=settings.claude_model,
         max_tokens=800,
@@ -148,10 +152,19 @@ async def chat_stream(user_id: str, session_id: str, user_message: str):
     async for chunk in stream:
         token = chunk.choices[0].delta.content or ""
         if token:
+            if first_token_at is None:
+                first_token_at = time.monotonic()
+                print(f"  ⏱ first_token:   {(first_token_at-t0)*1000:.0f}ms total  "
+                      f"(+{(first_token_at-t_ctx)*1000:.0f}ms LLM TTFT)")
             full_response += token
             yield {"token": token}
 
-    # ── 3. Fire background storage after stream completes ─────
+    t_end = time.monotonic()
+    print(f"  ⏱ stream_done:   {(t_end-t0)*1000:.0f}ms total")
+
+    # ── 3. Background storage — fire and forget ──────────────────
+    # Storage runs fully in background. User never waits for it.
+    # Badges/router log are populated by the UI's setTimeout refresh.
     asyncio.create_task(
         _background_store(
             user_id=user_id,
@@ -181,14 +194,22 @@ async def _background_store(
     user_message: str,
     assistant_message: str,
     context: dict,
-):
+) -> dict:
     """
-    All storage operations — runs after user sees response.
-    Errors are caught and logged, never surface to the user.
+    All storage operations. Now returns a result dict so chat_stream
+    can include routing/episodic info in the SSE done chunk for UI badges.
     """
+    result = {
+        "turn_number":     None,
+        "routing":         {},
+        "memories_stored": [],
+        "episodic_stored": None,
+        "summarization":   None,
+    }
     try:
         # Increment turn counter
         turn_number    = await sql.increment_session_turn(session_id)
+        result["turn_number"] = turn_number
         router_context = format_context_for_router(context)
 
         # Router + summarization in parallel
@@ -218,8 +239,14 @@ async def _background_store(
             router_decision=router_dict
         )
 
+        # Capture summarization result
+        if isinstance(summarization_result, dict) and summarization_result.get("summarized"):
+            result["summarization"] = summarization_result
+
         if not isinstance(decision, RoutingDecision):
-            return
+            return result
+
+        result["routing"] = decision.to_dict()
 
         # Neo4j — store facts via state machine
         if decision.trigger_user_memory and decision.user_memories:
@@ -239,15 +266,15 @@ async def _background_store(
                 memories=mem_list,
                 source_turn=turn_number
             )
+            result["memories_stored"] = mem_list
             # Invalidate Neo4j cache so next turn sees fresh facts
             await _invalidate_neo4j_cache(user_id)
 
         # MongoDB — store episodic if significant
-        if (
-            decision.trigger_episodic
-            and decision.episodic
-            and not isinstance(summarization_result, dict)
-        ):
+        # NOTE: condition was previously `not isinstance(summarization_result, dict)`
+        # which blocked episodic on every summarization turn — wrong.
+        # Episodic and summarization are independent — both can trigger on same turn.
+        if decision.trigger_episodic and decision.episodic:
             from memory.extractor import create_episodic_narrative
             recent_turns  = context.get("raw_turns", [])
             episode_turns = recent_turns[-2:] + [{
@@ -263,7 +290,7 @@ async def _background_store(
                     "tags":           decision.episodic.tags
                 }
             )
-            await mongo.store_episodic_memory(
+            ep_id = await mongo.store_episodic_memory(
                 user_id=user_id,
                 session_id=session_id,
                 title=narrative["title"],
@@ -278,9 +305,12 @@ async def _background_store(
                 topic_cluster=narrative.get("topic_cluster", "general"),
                 importance_score=narrative.get("importance_score", 5.0),
             )
+            result["episodic_stored"] = {"memory_id": ep_id, "title": narrative["title"]}
 
     except Exception as e:
         print(f"⚠ Background store error: {e}")
+
+    return result
 
 
 async def _invalidate_neo4j_cache(user_id: str):

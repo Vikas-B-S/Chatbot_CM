@@ -202,8 +202,19 @@ canonical_key conventions (use EXACTLY, never invent for known concepts):
   name, age, location, occupation, employer, coding_language, ui_theme,
   diet, primary_goal, career_goal, project_goal, tech_constraint, budget_constraint
 
-EPISODIC (MongoDB) — store when: personal problem-solving, decisions, emotional events, complex debugging
-  Skip for: simple Q&A, small talk, factual lookups
+EPISODIC (MongoDB) — store when ANY of these apply:
+  - Personal problem-solving or debugging (user is working through something)
+  - Decisions made (chose X over Y, decided to use Z)
+  - Emotional events (frustrated, excited, worried, proud)
+  - Learning sessions tied to user's goals or project (studying fine-tuning for RAG, exploring a library for their project)
+  - Technical deep-dives the user is actively exploring for their own use case
+  - Multi-turn topic exploration where user is building understanding for a specific purpose
+  - Progress on ongoing work ("I got X working", "I'm stuck on Y")
+
+  Skip ONLY for:
+  - Pure isolated factual lookups with no connection to user's goals ("what year was Python created")
+  - Pure small talk or greetings ("hi", "thanks", "ok")
+  - One-off questions clearly unrelated to anything the user is building or doing
 
 ## Output — ONLY this JSON, no markdown:
 {

@@ -98,7 +98,9 @@ async def init_mongo():
     # Operational indexes
     await col.create_index([("user_id", 1), ("created_at", -1)])
     await col.create_index([("user_id", 1), ("topic_cluster", 1), ("created_at", -1)])
-    await col.create_index([("user_id", 1), ("importance_score", -1)])
+    # Compound index: user_id → importance_score → created_at
+    # Covers the fallback sort — no full scan even with 100k episodes
+    await col.create_index([("user_id", 1), ("importance_score", -1), ("created_at", -1)], name="idx_user_importance_recency")
     await col.create_index([("user_id", 1), ("tags", 1)])
     await col.create_index([("user_id", 1), ("outcome", 1)])
     await col.create_index([("user_id", 1), ("content_hash", 1)])

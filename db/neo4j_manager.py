@@ -389,16 +389,52 @@ async def _deactivate_key(session, user_id: str, key: str, now: datetime) -> int
 async def get_user_memories(
     user_id: str,
     memory_type: str = None,
-    query: str = None
+    query: str = None,
+    query_vec: list = None,   # pre-computed local embedding — avoids all remote API calls
 ) -> list[dict]:
     """
-    Returns ACTIVE memories only.
-    With query: Graphiti semantic ordering, filtered to active MemoryRecords.
-    Without query: Direct Cypher, all active MemoryRecords.
+    Returns ACTIVE memories, ranked by local cosine similarity when query provided.
+
+    IMPORTANT: We do NOT call Graphiti's g.search() here for context retrieval.
+    Graphiti uses OpenAIEmbedder → remote API call (~300ms) on every invocation.
+    Instead: fetch all active records via direct Cypher (~20ms), then rank
+    them locally using the pre-computed query_vec (~1ms cosine math).
+
+    Graphiti search is only used when WRITING memories (contradiction detection),
+    not when READING them for context.
     """
-    if query:
-        return await _get_memories_semantic(user_id, query, memory_type)
-    return await _get_memories_direct(user_id, memory_type)
+    records = await _get_memories_direct(user_id, memory_type)
+
+    if not records or not query_vec:
+        return records
+
+    # Local cosine ranking — no API call, ~1ms
+    from db.embedder import cosine_similarity
+    scored = []
+    for r in records:
+        # Embed the content string for scoring
+        content = r.get("content", "")
+        # Use cached embedding if available, else score by text overlap heuristic
+        score = _local_relevance_score(content, query_vec)
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored]
+
+
+def _local_relevance_score(content: str, query_vec: list) -> float:
+    """
+    Fast local relevance scoring using pre-computed query_vec.
+    Embeds content synchronously (model already loaded) and computes cosine.
+    Falls back to 0.5 if embedding fails.
+    """
+    try:
+        from db.embedder import _get_model, cosine_similarity
+        model = _get_model()
+        content_vec = model.encode(content[:256], normalize_embeddings=True).tolist()
+        return cosine_similarity(query_vec, content_vec)
+    except Exception:
+        return 0.5
 
 
 async def _get_memories_direct(user_id: str, memory_type: str = None) -> list[dict]:

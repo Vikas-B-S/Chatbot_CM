@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     # ── LLM via OpenRouter ────────────────────────────────────
     openrouter_api_key:  str = Field(...,    env="OPENROUTER_API_KEY")
     openrouter_base_url: str = Field("https://openrouter.ai/api/v1", env="OPENROUTER_BASE_URL")
-    claude_model:        str = Field("anthropic/claude-haiku-4-5",   env="CLAUDE_MODEL")
+    claude_model:        str = Field("google/gemini-flash-2.0",   env="CLAUDE_MODEL")
+    router_model:        str = Field("google/gemini-flash-2.0",   env="ROUTER_MODEL")
 
     # ── Embeddings (used by Graphiti for semantic search) ─────
     embedding_model: str = Field("openai/text-embedding-3-small", env="EMBEDDING_MODEL")

@@ -363,6 +363,26 @@ async def get_unsummarized_turns(session_id: str) -> list:
     return [dict(r) for r in rows]
 
 
+async def get_last_turn(session_id: str) -> Optional[dict]:
+    """Return the most recently stored turn for a session, including router_decision."""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM turn_logs WHERE session_id=? ORDER BY turn_number DESC LIMIT 1",
+            (session_id,)
+        )
+        row = await cur.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    if result.get('router_decision'):
+        try:
+            result['router_decision'] = json.loads(result['router_decision'])
+        except Exception:
+            pass
+    return result
+
+
 async def get_turns_in_range(session_id: str, start: int, end: int) -> list:
     async with get_db() as db:
         db.row_factory = aiosqlite.Row

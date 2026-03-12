@@ -504,6 +504,40 @@ header {
 .typing-dot:nth-child(2) { animation-delay: 0.2s; background: var(--text2); }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; background: var(--text3); }
 
+/* ── Streaming cursor ─────────────────────────────────────── */
+/* ── Markdown rendering ─────────────────────────────────── */
+.msg-bubble pre {
+  background: #0a0f16; border: 1px solid var(--border2);
+  border-radius: 5px; padding: 10px 12px; margin: 8px 0;
+  overflow-x: auto; font-family: var(--font-mono); font-size: 12px;
+}
+.msg-bubble code {
+  font-family: var(--font-mono); font-size: 12px;
+  background: rgba(0,212,255,0.07); color: var(--accent);
+  padding: 1px 5px; border-radius: 3px;
+}
+.msg-bubble pre code { background: none; color: var(--text2); padding: 0; }
+.msg-bubble ul { padding-left: 18px; margin: 6px 0; }
+.msg-bubble li { margin: 3px 0; }
+.msg-bubble strong { color: var(--text); font-weight: 700; }
+
+.stream-cursor {
+  display: inline-block;
+  width: 2px; height: 14px;
+  background: var(--accent);
+  border-radius: 1px;
+  margin-left: 2px;
+  vertical-align: middle;
+  animation: cur-blink 0.6s step-end infinite;
+}
+@keyframes cur-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+.streaming-bubble {
+  border-left: 2px solid var(--accent) !important;
+}
+
 @keyframes typingBounce {
   0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
   30%            { transform: translateY(-5px); opacity: 1; }
@@ -1082,7 +1116,8 @@ function doLogout() {
 function updateSessionPill() {
   const sess = allSessions.find(s => s.session_id === sessionId);
   document.getElementById('sp-name-display').textContent  = sess?.name || 'Session';
-  document.getElementById('sp-turns-display').textContent = sess ? `T${sess.total_turns || turnCount}` : '';
+  // Always use live turnCount — sess.total_turns is stale from login
+  document.getElementById('sp-turns-display').textContent = `T${turnCount}`;
   renderSessionList();
 }
 
@@ -1120,6 +1155,7 @@ function switchToSession(sess) {
   closeSessionDropdown();
   showToast(`switched to ${sess.name || 'session'}`);
   loadMemories();
+  loadEpisodic();
 }
 
 async function newSession(e) {
@@ -1204,7 +1240,7 @@ async function sendMessage() {
   input.value = ''; input.style.height = 'auto';
   document.getElementById('send-btn').disabled = true;
 
-  addMessage('user', text, ++turnCount);
+  addMessage('user', text, turnCount + 1);  // preview — finalise increments
   const typingId = addTyping();
 
   try {
@@ -1255,6 +1291,15 @@ async function sendMessage() {
             document.getElementById('sp-turns-display').textContent = `T${turnCount}`;
             const sess = allSessions.find(s => s.session_id === sessionId);
             if (sess) sess.total_turns = turnCount;
+
+            // Storage runs in background on server (~1-2s after stream ends).
+            // After delay: refresh panels AND fetch routing info for badges/log.
+            const capturedMsgId = msgId;
+            setTimeout(async () => {
+              loadMemories();
+              loadEpisodic();
+              await loadLastTurnRouting(capturedMsgId);
+            }, 2500);
           }
 
           if (chunk.error) throw new Error(chunk.error);
@@ -1275,9 +1320,13 @@ async function sendMessage() {
 function addStreamingMessage(msgId) {
   const container = document.getElementById('messages');
   const div = document.createElement('div');
-  div.className = 'message assistant streaming';
+  div.className = 'message assistant';
   div.id = msgId;
-  div.innerHTML = `<div class="msg-content"><span class="stream-cursor">▋</span></div>`;
+  // msg-meta must be present — without it the CSS selector
+  // .message.assistant .msg-bubble doesn't apply background correctly
+  div.innerHTML = `
+    <div class="msg-meta"><span>Synapse</span> <span class="turn-tag" id="${msgId}-turn"></span></div>
+    <div class="msg-bubble streaming-bubble"><span class="stream-cursor">▋</span></div>`;
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
 }
@@ -1285,20 +1334,23 @@ function addStreamingMessage(msgId) {
 function updateStreamingMessage(msgId, text) {
   const div = document.getElementById(msgId);
   if (!div) return;
-  // Render markdown-like formatting inline
-  const escaped = text.replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  div.querySelector('.msg-content').innerHTML =
-    escaped + '<span class="stream-cursor">▋</span>';
+  const bubble = div.querySelector('.msg-bubble');
+  if (!bubble) return;
+  const escaped = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  bubble.innerHTML = escaped + '<span class="stream-cursor">▋</span>';
   div.scrollIntoView({ block: 'nearest' });
 }
 
 function finaliseStreamingMessage(msgId, text, turn) {
   const div = document.getElementById(msgId);
   if (!div) return;
-  div.classList.remove('streaming');
-  // Remove cursor, set final formatted text
-  const escaped = text.replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  div.querySelector('.msg-content').innerHTML = escaped;
+  const bubble = div.querySelector('.msg-bubble');
+  if (!bubble) return;
+  bubble.classList.remove('streaming-bubble');
+  bubble.innerHTML = renderMarkdown(text);
+  // Fill in turn number now that we know it
+  const turnTag = document.getElementById(`${msgId}-turn`);
+  if (turnTag) turnTag.textContent = `T${turn}`;
   div.setAttribute('data-turn', turn);
 }
 
@@ -1326,7 +1378,11 @@ function addMessage(role, text, turn, badges = []) {
 
   const bubble = document.createElement('div');
   bubble.className = 'msg-bubble';
-  bubble.textContent = text;
+  if (role === 'assistant') {
+    bubble.innerHTML = renderMarkdown(text);
+  } else {
+    bubble.textContent = text;
+  }
 
   div.appendChild(meta);
   div.appendChild(bubble);
@@ -1345,6 +1401,40 @@ function addMessage(role, text, turn, badges = []) {
 
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
+}
+
+// Simple markdown renderer — bold, code, numbered/bullet lists
+function renderMarkdown(text) {
+  // Escape HTML first
+  let html = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Code blocks (must run before inline code)
+  html = html.replace(/```[\w]*\n?([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // Bold and italic
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // List items
+  html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
+  html = html.replace(/^[-•]\s+(.+)$/gm, '<li>$1</li>');
+
+  // Wrap consecutive <li> tags in <ul>
+  html = html.replace(/(<li>[\s\S]*?<\/li>)(\s*<li>[\s\S]*?<\/li>)*/g, m => '<ul>' + m + '</ul>');
+
+  // Line breaks (outside pre blocks)
+  const parts = html.split(/(<pre>[\s\S]*?<\/pre>)/g);
+  html = parts.map((part, i) =>
+    i % 2 === 0 ? part.replace(/\n/g, '<br>') : part
+  ).join('');
+
+  return html;
 }
 
 let typingCounter = 0;
@@ -1443,6 +1533,34 @@ async function loadEpisodic() {
         </div>`;
       scroll.insertBefore(card, scroll.firstChild);
     });
+  } catch(e) {}
+}
+
+// ── Fetch last turn routing after storage completes ──────────
+async function loadLastTurnRouting(msgId) {
+  try {
+    const res = await fetch(`${API}/sessions/${sessionId}/last_turn`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.turn_number) return;
+
+    // Add badges to the message bubble
+    const badges = buildBadges(data);
+    if (badges.length > 0) {
+      const msgDiv = document.getElementById(msgId);
+      if (msgDiv && !msgDiv.querySelector('.routing-info')) {
+        const ri = document.createElement('div');
+        ri.className = 'routing-info';
+        badges.forEach(b => {
+          const badge = document.createElement('span');
+          badge.className = `r-badge ${b.cls}`;
+          badge.textContent = b.text;
+          ri.appendChild(badge);
+        });
+        msgDiv.appendChild(ri);
+      }
+    }
+    logRouter(data);
   } catch(e) {}
 }
 

@@ -77,23 +77,9 @@ async def check_and_run_summarization(
     if l2_result:
         handoff_result = await _write_handoff(session_id, user_id)
 
-    # ── E: Episodic narrative for this batch ──────────────────
+    # Episodic storage is handled by agent.py _background_store() directly.
+    # episodic_decision param kept for API compatibility but not used here.
     episodic_stored = None
-    if episodic_decision and episodic_decision.get("should_store"):
-        narrative = await create_episodic_narrative(turns, episodic_decision)
-        ep_id = await mongo.store_episodic_memory(
-            user_id=user_id, session_id=session_id,
-            title=narrative["title"], content=narrative["content"],
-            outcome=narrative["outcome"],
-            turn_start=actual_start, turn_end=actual_end,
-            key_entities=episodic_decision.get("key_entities", []),
-            emotional_tone=episodic_decision.get("emotional_tone", "neutral"),
-            emotional_intensity=episodic_decision.get("emotional_intensity", 2),
-            tags=episodic_decision.get("tags", []),
-            topic_cluster=narrative.get("topic_cluster", "general"),
-            importance_score=narrative.get("importance_score", 5.0),
-        )
-        episodic_stored = {"memory_id": ep_id, "title": narrative["title"]}
 
     return {
         "summarized":    True,

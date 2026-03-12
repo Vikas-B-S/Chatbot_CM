@@ -320,6 +320,28 @@ async def get_session(session_id: str):
     return s
 
 
+@app.get("/sessions/{session_id}/last_turn")
+async def get_last_turn(session_id: str):
+    """
+    Returns the last stored turn for a session including routing decision.
+    UI polls this ~2.5s after stream ends to get badges and router log data.
+    """
+    s = await sql.get_session(session_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+    turn = await sql.get_last_turn(session_id)
+    if not turn:
+        return {"turn_number": None}
+    rd = turn.get("router_decision") or {}
+    return {
+        "turn_number":     turn["turn_number"],
+        "routing":         rd,
+        "memories_stored": rd.get("user_memories", []),
+        "episodic_stored":  {"title": "stored"} if rd.get("episodic_should_store") else None,
+        "summarization":    None,   # summarization data not stored in turn_logs
+    }
+
+
 @app.get("/sessions/{session_id}/summaries")
 async def get_session_summaries(session_id: str):
     if not await sql.get_session(session_id):

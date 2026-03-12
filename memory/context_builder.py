@@ -51,10 +51,8 @@ def should_summarize(turn_number: int) -> tuple[bool, int, int]:
 async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
     """
     Neo4j with Redis-backed 30s cache.
-
-    Cache key: neo4j_cache:{user_id}
-    On hit:  return cached list in ~5ms
-    On miss: call Neo4j (~200-800ms), cache result, return
+    Cache stores the direct (unranked) result. Ranking happens after cache hit
+    so we don't store query-specific orderings.
     """
     from db.redis_manager import get_redis
     r         = await get_redis()
@@ -63,14 +61,20 @@ async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
     try:
         cached = await r.get(cache_key)
         if cached:
-            return json.loads(cached)
+            records = json.loads(cached)
+            # Re-rank cached results with current query_vec (local, ~1ms)
+            if query_vec and records:
+                from db.neo4j_manager import _local_relevance_score
+                scored = sorted(records, key=lambda rec: _local_relevance_score(rec.get("content",""), query_vec), reverse=True)
+                return scored
+            return records
     except Exception:
         pass
 
-    # Cache miss — call Neo4j
-    result = await neo4j.get_user_memories(user_id, query=query)
+    # Cache miss — direct Cypher fetch (no remote embedding API)
+    result = await neo4j.get_user_memories(user_id, query=query, query_vec=query_vec)
 
-    # Store in cache
+    # Cache the unranked list (so different queries can re-rank it)
     try:
         await r.set(cache_key, json.dumps(result), ex=_NEO4J_CACHE_TTL)
     except Exception:
@@ -86,19 +90,11 @@ async def build_context(
 ) -> dict:
     """
     Parallel fetch from all 4 stores with single shared query embedding.
-
-    Flow:
-      1. Embed user_message ONCE (if present)
-      2. Fire all 4 store fetches in parallel, passing pre-computed vector
-      3. Graceful degradation — if any store fails, returns empty list for it
-
-    The shared query_vec is passed to Neo4j (cache layer), MongoDB, and Redis
-    so none of them need to call the embedding API themselves.
+    Embed once, pass vector to all stores — no duplicate API calls.
     """
     def safe(v):
         return v if not isinstance(v, Exception) else []
 
-    # ── Embed once ────────────────────────────────────────────
     query_vec = None
     if user_message:
         try:
@@ -106,7 +102,6 @@ async def build_context(
         except Exception:
             query_vec = None
 
-    # ── Parallel fetch ────────────────────────────────────────
     results = await asyncio.gather(
         _get_neo4j_cached(user_id, user_message, query_vec),
         mongo.get_user_episodic_memories(
@@ -127,7 +122,7 @@ async def build_context(
         "episodic_memories": safe(episodic),
         "summaries":         safe(summaries),
         "raw_turns":         safe(raw_turns),
-        "query_vec":         query_vec,   # carry forward for agent use
+        "query_vec":         query_vec,
     }
 
 
