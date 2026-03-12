@@ -328,7 +328,8 @@ async def get_user_episodic_memories(
     user_id: str,
     limit: int = 5,
     session_id: str = None,
-    query: str = None
+    query: str = None,
+    query_vec: list = None,   # pre-computed embedding — skip embed call if provided
 ) -> list:
     """
     Retrieve episodic memories using 4-component hybrid scoring.

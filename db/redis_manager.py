@@ -204,6 +204,7 @@ async def get_latest_summaries_for_context(
     session_id: str,
     user_id: str = None,
     query: str = None,
+    query_vec: list = None,   # pre-computed embedding — skip embed call if provided
     max_total: int = 8,
 ) -> list:
     """
@@ -267,7 +268,7 @@ async def get_latest_summaries_for_context(
         # Step 1: fetch all embeddings from hash (tiny payload)
         r         = await get_redis()
         emb_hash  = await r.hgetall(f"emb:{session_id}")
-        query_vec = await embed_text(query)
+        query_vec = query_vec or await embed_text(query)
 
         # Step 2: score all candidates — only float math
         scored = []

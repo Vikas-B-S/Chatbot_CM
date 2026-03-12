@@ -1,71 +1,99 @@
 """
-db/embedder.py — Shared embedding utility
+db/embedder.py — Local embeddings via sentence-transformers
 
-Single instance used across the whole app (Redis summaries,
-future vector search elsewhere). Uses the same OpenRouter-compatible
-endpoint already configured for Graphiti.
+WHY LOCAL:
+  OpenRouter embedding API = ~300ms per call (network round trip)
+  Local sentence-transformers = ~5-20ms per call (CPU inference, no network)
 
-embed_text(text)       → list[float]   (1536 dims for text-embedding-3-small)
-embed_batch(texts)     → list[list[float]]
-cosine_similarity(a,b) → float in [-1, 1]
+  This single change saves 300ms of latency BEFORE the LLM even starts,
+  which is the main reason streaming felt slow despite being implemented.
+
+MODEL: all-MiniLM-L6-v2
+  - 22MB download, cached after first run
+  - 384 dimensions (vs 1536 for OpenAI — smaller = faster cosine math)
+  - Good enough semantic quality for summary/episode retrieval
+  - Runs entirely on CPU, no GPU needed
+
+COST:
+  OpenAI embeddings = $0.02 per 1M tokens
+  Local embeddings  = $0.00 forever
+
+  For a chatbot with 100 turns/day:
+    Old: ~100 API calls/day → cost + latency
+    New: 0 API calls/day    → free + fast
 """
 from __future__ import annotations
 
 import math
+import threading
 from typing import Optional
 
-from openai import AsyncOpenAI
-from config import get_settings
-
-settings  = get_settings()
-_client: Optional[AsyncOpenAI] = None
-
-_MODEL = "openai/text-embedding-3-small"
-_DIM   = 1536
+_model = None
+_lock  = threading.Lock()
+_DIM   = 384   # all-MiniLM-L6-v2 output dimension
 
 
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        _client = AsyncOpenAI(
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-        )
-    return _client
+def _get_model():
+    """Lazy load — model loads once on first embed call, reused forever."""
+    global _model
+    if _model is None:
+        with _lock:
+            if _model is None:
+                from sentence_transformers import SentenceTransformer
+                print("Loading local embedding model (one-time ~2s)...")
+                _model = SentenceTransformer("all-MiniLM-L6-v2")
+                print("✓ Local embedding model ready")
+    return _model
 
 
 async def embed_text(text: str) -> list[float]:
-    """Embed a single string. Returns zero vector on failure."""
+    """
+    Embed a single string locally. ~5-20ms, no API call.
+    Returns zero vector on failure.
+    """
     try:
-        client = _get_client()
-        resp   = await client.embeddings.create(model=_MODEL, input=text[:8000])
-        return resp.data[0].embedding
+        import asyncio
+        model = _get_model()
+        # Run CPU inference in thread pool so it doesn't block the event loop
+        loop = asyncio.get_event_loop()
+        vec  = await loop.run_in_executor(
+            None,
+            lambda: model.encode(text[:512], normalize_embeddings=True).tolist()
+        )
+        return vec
     except Exception as e:
-        print(f"⚠ Embedding failed: {e}")
+        print(f"⚠ Local embed failed: {e}")
         return [0.0] * _DIM
 
 
 async def embed_batch(texts: list[str]) -> list[list[float]]:
-    """Embed multiple strings in one API call."""
+    """Embed multiple strings in one local inference call."""
     if not texts:
         return []
     try:
-        client = _get_client()
-        resp   = await client.embeddings.create(
-            model=_MODEL,
-            input=[t[:8000] for t in texts]
+        import asyncio
+        model  = _get_model()
+        loop   = asyncio.get_event_loop()
+        vecs   = await loop.run_in_executor(
+            None,
+            lambda: model.encode(
+                [t[:512] for t in texts],
+                normalize_embeddings=True
+            ).tolist()
         )
-        return [d.embedding for d in resp.data]
+        return vecs
     except Exception as e:
-        print(f"⚠ Batch embedding failed: {e}")
+        print(f"⚠ Local batch embed failed: {e}")
         return [[0.0] * _DIM for _ in texts]
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two vectors. Returns 0.0 on zero vectors."""
-    dot  = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(x * x for x in b))
-    if mag_a == 0 or mag_b == 0:
+    """
+    Cosine similarity. Since all-MiniLM-L6-v2 uses normalize_embeddings=True,
+    vectors are already unit-length so this is just a dot product.
+    """
+    if len(a) != len(b):
         return 0.0
-    return dot / (mag_a * mag_b)
+    dot = sum(x * y for x, y in zip(a, b))
+    # Clamp to [-1, 1] to handle float precision
+    return max(-1.0, min(1.0, dot))

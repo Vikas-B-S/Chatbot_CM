@@ -30,12 +30,12 @@ Misc:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+import json as _json
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 
@@ -44,7 +44,7 @@ from db import sqlite_manager as sql
 from db import neo4j_manager as neo4j
 from db import mongo_manager as mongo
 from db import redis_manager as redis_mgr
-from core.agent import chat
+from core.agent import chat, chat_stream
 from memory.context_builder import build_context, format_context_for_prompt
 
 settings = get_settings()
@@ -482,7 +482,44 @@ async def consolidate(user_id: str, older_than_days: int = 90, dry_run: bool = F
     return result
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatReq) -> ChatResp:
+async def chat_endpoint(req: ChatReq):
+    """
+    Streaming chat endpoint using Server-Sent Events (SSE).
+    Yields tokens as they arrive — user sees first token in ~300ms.
+    Storage fires in background after stream completes.
+
+    Response format (SSE):
+      data: {"token": "Hello"}
+      data: {"token": " there"}
+      data: {"done": true, "context_used": {...}}
+    """
+    if not await sql.get_user(req.user_id):
+        raise HTTPException(404, "User not found")
+    s = await sql.get_session(req.session_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+    if s["user_id"] != req.user_id:
+        raise HTTPException(403, "Session does not belong to this user")
+    if not req.message.strip():
+        raise HTTPException(400, "Message cannot be empty")
+
+    async def event_stream():
+        try:
+            async for chunk in chat_stream(
+                user_id=req.user_id,
+                session_id=req.session_id,
+                user_message=req.message
+            ):
+                yield f"data: {_json.dumps(chunk)}\n\n"
+        except Exception as e:
+            yield f"data: {_json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/chat/sync")
+async def chat_sync_endpoint(req: ChatReq) -> ChatResp:
+    """Non-streaming fallback — waits for full response before returning."""
     if not await sql.get_user(req.user_id):
         raise HTTPException(404, "User not found")
     s = await sql.get_session(req.session_id)

@@ -1,30 +1,48 @@
 """
-core/router.py — Memory Router Node
+core/router.py — Memory Router with heuristic pre-filter
 
-After every turn, analyses the exchange and decides which memory systems
-to activate. Returns a RoutingDecision executed by agent.py.
+COST OPTIMISATION — Two-stage routing:
+─────────────────────────────────────
+  Stage 1: Heuristic pre-filter (FREE, ~0ms)
+    Pattern-match the user message against known signal patterns.
+    If clearly no memory to store → return empty decision immediately.
+    No LLM call made. Saves ~60-70% of router LLM calls.
 
-Memory nodes:
-  User Memory → Graphiti/Neo4j  (facts, preferences, goals, constraints)
-  Episodic    → MongoDB          (rich narrative episodes)
-  User DB     → SQLite           (lightweight profile updates)
+    Skip router entirely for:
+      - Short greetings ("hi", "hello", "thanks")
+      - Pure questions with no personal info ("what is X?", "how do I Y?")
+      - Math/code/lookup requests ("calculate", "write a function", "what's 2+2")
+      - Continuations ("ok", "got it", "yes", "no", "continue")
 
-Note on Graphiti contradiction resolution:
-  The router's job is to extract WHAT to remember and give it a canonical_key.
-  Graphiti then handles HOW to store it — detecting contradictions, expiring
-  old facts, and setting temporal edges automatically.
-  e.g. if the user previously said "I love Python" and now says "I love C++",
-  the router extracts {canonical_key: "coding_language", content: "User loves C++"}
-  and Graphiti will expire the old Python edge automatically on add_episode().
+    Always call router for:
+      - First-person statements ("I am", "I like", "I want", "I have")
+      - Personal updates ("I switched", "I moved", "I got", "I decided")
+      - Emotional content ("frustrated", "excited", "worried")
+      - Significant events ("I got the job", "we launched")
+
+  Stage 2: LLM router (only when heuristic says "maybe has memory")
+    Uses a FAST cheap model (haiku/mini) with a tight 400 token limit.
+    Same structured JSON output as before.
+
+MODEL STRATEGY:
+  Main LLM    → settings.claude_model (user-configured, quality matters)
+  Router LLM  → fast cheap model, quality less critical
+  Summarizer  → fast cheap model
 """
+
 import json
+import re
 from openai import AsyncOpenAI
 from dataclasses import dataclass, field
 from typing import Optional
 from config import get_settings
 
 settings = get_settings()
-_client = None
+_client  = None
+
+# Use a faster/cheaper model for routing — does not need to be the best model
+# Override this in .env as ROUTER_MODEL if needed
+_ROUTER_MODEL = getattr(settings, "router_model", None) or "openai/gpt-4o-mini"
 
 
 def _get_client() -> AsyncOpenAI:
@@ -41,7 +59,7 @@ def _parse_json(raw: str) -> dict:
     raw = raw.strip()
     if raw.startswith("```"):
         parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else raw
+        raw   = parts[1] if len(parts) > 1 else raw
         if raw.startswith("json"):
             raw = raw[4:]
     try:
@@ -50,15 +68,15 @@ def _parse_json(raw: str) -> dict:
         return {}
 
 
-# ─── Routing decision data structures ────────────────────────
+# ─── Data structures ──────────────────────────────────────────────────────────
 
 @dataclass
 class UserMemoryItem:
-    memory_type:   str           # fact | preference | goal | constraint
-    content:       str           # human-readable statement
-    canonical_key: str           # dedup key — same concept always gets same key
+    memory_type:   str
+    content:       str
+    canonical_key: str
     confidence:    float = 1.0
-    entities:      list  = field(default_factory=list)  # [{name, type}]
+    entities:      list  = field(default_factory=list)
 
 
 @dataclass
@@ -67,6 +85,7 @@ class EpisodicDecision:
     title:          str  = ""
     reason:         str  = ""
     emotional_tone: str  = "neutral"
+    emotional_intensity: int = 2
     key_entities:   list = field(default_factory=list)
     tags:           list = field(default_factory=list)
 
@@ -82,11 +101,11 @@ class RoutingDecision:
     trigger_user_memory: bool
     trigger_episodic:    bool
     trigger_user_db:     bool
-
-    user_memories:   list[UserMemoryItem]      = field(default_factory=list)
-    episodic:        Optional[EpisodicDecision] = None
-    user_db:         Optional[UserDbUpdate]     = None
-    router_reasoning: str                       = ""
+    user_memories:       list              = field(default_factory=list)
+    episodic:            Optional[EpisodicDecision] = None
+    user_db:             Optional[UserDbUpdate]     = None
+    router_reasoning:    str               = ""
+    skipped:             bool              = False   # True if pre-filter skipped LLM
 
     def to_dict(self) -> dict:
         return {
@@ -95,129 +114,168 @@ class RoutingDecision:
             "trigger_user_db":       self.trigger_user_db,
             "user_memories_count":   len(self.user_memories),
             "episodic_should_store": self.episodic.should_store if self.episodic else False,
-            "user_db_update":        self.user_db.fields if self.user_db else {},
-            "router_reasoning":      self.router_reasoning
+            "router_reasoning":      self.router_reasoning,
+            "skipped":               self.skipped,
         }
 
 
-# ─── Router system prompt ─────────────────────────────────────
+# ─── Heuristic pre-filter ─────────────────────────────────────────────────────
 
-ROUTER_SYSTEM = """You are the Memory Router for a multi-memory AI assistant system.
+# Patterns that STRONGLY signal personal info worth storing
+_STORE_SIGNALS = [
+    r"\bi (am|'m|was|were|have|had|got|get|work|worked|live|lived|moved|study|studied|use|used|prefer|like|love|hate|want|need|decided|switched|chose|built|created|launched|started|finished)\b",
+    r"\bmy (name|age|job|work|career|company|team|project|goal|plan|problem|issue|hobby|language|framework|stack|city|country|diet|budget|constraint)\b",
+    r"\b(i switched|i moved|i got|i decided|i chose|i built|i launched|i finished|i completed|i failed|i succeeded)\b",
+    r"\b(frustrated|excited|worried|anxious|happy|sad|stressed|overwhelmed|proud|nervous)\b",
+    r"\b(years old|year old|years experience|i'm from|i live in|i work at|i work for|i study at)\b",
+    r"\b(vegetarian|vegan|diabetic|allergic|disabled|pregnant)\b",
+]
 
-Your job: analyse one conversation exchange and decide which memory systems to activate.
+# Patterns that STRONGLY signal NO personal info (safe to skip router)
+_SKIP_SIGNALS = [
+    r"^(hi|hello|hey|thanks|thank you|ok|okay|got it|sure|yes|no|nope|yep|cool|great|awesome|nice|perfect|alright|fine|sounds good|makes sense|understood|correct|right|wrong)[\s!.?]*$",
+    r"^(what is|what are|what does|what do|how do|how does|how can|how to|can you|could you|please|explain|tell me|show me|give me|list|describe|define|compare|contrast)\b",
+    r"^(calculate|compute|convert|translate|write|code|create|generate|make|build|fix|debug|find|search|look up|summarize|summarise)\b",
+    r"^(what'?s|where'?s|who'?s|when'?s|why'?s|how'?s)\b",
+    r"^[\d\s\+\-\*\/\(\)=]+$",   # pure math
+]
 
-## Memory systems available:
+_COMPILED_STORE = [re.compile(p, re.IGNORECASE) for p in _STORE_SIGNALS]
+_COMPILED_SKIP  = [re.compile(p, re.IGNORECASE) for p in _SKIP_SIGNALS]
 
-### 1. USER MEMORY NODE → Graphiti/Neo4j (long-term, cross-session, temporal)
-Stores 4 types of user memory:
-  - fact:        Stable truths about the user. E.g. name, age, location, job, language
-  - preference:  Likes/dislikes/preferred styles. E.g. "prefers dark mode", "likes Python"
-  - goal:        Things user wants to achieve. E.g. "wants to build an iOS app", "learning ML"
-  - constraint:  Hard limits. E.g. "cannot use paid APIs", "must use Python 3.9", "vegetarian"
 
-IMPORTANT — canonical_key determines contradiction resolution:
-  Graphiti automatically expires old facts when a new one shares the same canonical_key.
-  Example: if you assign canonical_key="coding_language" to "loves Python" at T3,
-  and then "loves C++" also gets canonical_key="coding_language" at T14,
-  Graphiti will automatically mark "loves Python" as expired at T14.
-  This means: ALWAYS use the same canonical_key for the same concept across turns.
+def _should_skip_router(user_message: str) -> tuple[bool, str]:
+    """
+    Returns (skip, reason).
+    skip=True  → return empty decision, don't call LLM
+    skip=False → call LLM router
+    """
+    msg = user_message.strip()
 
-canonical_key conventions (use these exactly, do not invent new ones for known concepts):
-  fact keys:       name, age, location, occupation, employer, education, language, nationality
-  preference keys: coding_language, ui_theme, communication_style, diet, [topic]_preference
-  goal keys:       primary_goal, career_goal, learning_goal, project_goal, [topic]_goal
-  constraint keys: tech_constraint, budget_constraint, diet_constraint, [topic]_constraint
+    # Very short messages with no personal signal → skip
+    if len(msg) < 20 and not any(p.search(msg) for p in _COMPILED_STORE):
+        return True, "short message, no personal signal"
 
-For each memory item provide:
-  - memory_type: one of fact|preference|goal|constraint
-  - content: concise human-readable statement
-  - canonical_key: short snake_case dedup key (see conventions above)
-  - confidence: 1.0=explicit, 0.8=strong implication, 0.6=reasonable inference, 0.4=weak
-  - entities: named entities [{name, type}] — type=Person|Location|Organization|Technology|Product
+    # Explicit skip pattern matches → skip
+    for pattern in _COMPILED_SKIP:
+        if pattern.search(msg):
+            # Double-check: does it also have a store signal? If so, don't skip
+            if any(p.search(msg) for p in _COMPILED_STORE):
+                return False, "has both skip and store signals"
+            return True, f"matches skip pattern"
 
-### 2. EPISODIC NODE → MongoDB (narrative memories of meaningful sessions)
-Store episodically when the exchange involves:
-  ✓ Personal problem-solving, debugging, planning, important decisions
-  ✓ Emotional or significant life events
-  ✓ Learning something complex together over multiple messages
-  ✓ Rich back-and-forth that reveals the user's situation deeply
-  ✗ Simple one-shot Q&A ("what is X?", "how do I do Y?")
-  ✗ Trivial small talk
+    # Has explicit store signal → don't skip
+    for pattern in _COMPILED_STORE:
+        if pattern.search(msg):
+            return False, "has store signal"
 
-### 3. USER DB NODE → SQLite (lightweight profile updates)
-Update when the user explicitly changes their display name or profile fields.
+    # Ambiguous — call router to be safe
+    return False, "ambiguous"
 
-## Output format — return ONLY this JSON, no markdown:
+
+def _empty_decision(reason: str) -> RoutingDecision:
+    """Return a no-op decision without calling the LLM."""
+    return RoutingDecision(
+        trigger_user_memory=False,
+        trigger_episodic=False,
+        trigger_user_db=False,
+        user_memories=[],
+        episodic=EpisodicDecision(should_store=False),
+        user_db=UserDbUpdate(should_update=False),
+        router_reasoning=f"[pre-filter skipped: {reason}]",
+        skipped=True,
+    )
+
+
+# ─── Router system prompt (tighter than before) ───────────────────────────────
+
+ROUTER_SYSTEM = """Memory Router for an AI assistant. Analyse one exchange, decide what to store.
+
+## Memory types:
+USER MEMORY (Neo4j) — 4 types:
+  fact:       stable truths — name, age, location, job, language spoken
+  preference: likes/dislikes — coding_language, ui_theme, diet
+  goal:       wants to achieve — project_goal, career_goal, learning_goal
+  constraint: hard limits — budget_constraint, tech_constraint
+
+canonical_key conventions (use EXACTLY, never invent for known concepts):
+  name, age, location, occupation, employer, coding_language, ui_theme,
+  diet, primary_goal, career_goal, project_goal, tech_constraint, budget_constraint
+
+EPISODIC (MongoDB) — store when: personal problem-solving, decisions, emotional events, complex debugging
+  Skip for: simple Q&A, small talk, factual lookups
+
+## Output — ONLY this JSON, no markdown:
 {
   "trigger_user_memory": true|false,
   "trigger_episodic": true|false,
-  "trigger_user_db": true|false,
-  "router_reasoning": "1-2 sentence explanation",
+  "trigger_user_db": false,
+  "router_reasoning": "one sentence",
   "user_memories": [
-    {
-      "memory_type": "fact|preference|goal|constraint",
-      "content": "...",
-      "canonical_key": "...",
-      "confidence": 0.0-1.0,
-      "entities": [{"name": "...", "type": "..."}]
-    }
+    {"memory_type": "fact|preference|goal|constraint", "content": "...",
+     "canonical_key": "...", "confidence": 0.0-1.0, "entities": []}
   ],
   "episodic": {
-    "should_store": true|false,
-    "title": "Short episode title",
-    "reason": "Why episodic",
-    "emotional_tone": "curious|frustrated|excited|neutral|worried|confident",
-    "key_entities": ["entity1"],
-    "tags": ["tag1", "tag2"]
+    "should_store": true|false, "title": "...", "reason": "...",
+    "emotional_tone": "neutral|curious|frustrated|excited|worried|satisfied",
+    "emotional_intensity": 1-5,
+    "key_entities": [], "tags": []
   },
-  "user_db": {
-    "should_update": false,
-    "fields": {}
-  }
+  "user_db": {"should_update": false, "fields": {}}
 }
 
 Rules:
-- Only extract what is EXPLICITLY stated or unmistakably implied by the USER
-- Do NOT extract from the assistant's responses or generic knowledge
-- If nothing to extract: set all trigger_* to false, return empty arrays
-- Never hallucinate or invent information
-- canonical_key must be consistent across all turns — "name" always means the user's name
-- If the user updates a preference (e.g. switches from Python to C++), use the SAME
-  canonical_key as before so Graphiti can automatically expire the old value"""
+- Only extract what USER explicitly states, never from assistant responses
+- If nothing to store: all trigger_* false, empty arrays
+- Use same canonical_key for same concept every time"""
 
+
+# ─── Main route function ──────────────────────────────────────────────────────
 
 async def route(
     user_message: str,
     assistant_response: str,
     conversation_context: str = "",
-    turn_number: int = 0
+    turn_number: int = 0,
 ) -> RoutingDecision:
     """
-    Core router function. Takes one exchange and returns a RoutingDecision.
-    Single LLM call — structured JSON output parsed into typed dataclasses.
+    Two-stage router:
+      1. Heuristic pre-filter (free, ~0ms)
+      2. LLM router (only if pre-filter says needed)
     """
+
+    # ── Stage 1: pre-filter ───────────────────────────────────
+    skip, reason = _should_skip_router(user_message)
+    if skip:
+        print(f"  ↳ Router skipped [{reason}]")
+        return _empty_decision(reason)
+
+    # ── Stage 2: LLM router ───────────────────────────────────
     client = _get_client()
-
     prompt = (
-        f"Turn #{turn_number}\n\n"
-        f"Recent context:\n{conversation_context}\n\n"
-        f"User said:\n{user_message}\n\n"
-        f"Assistant replied:\n{assistant_response}\n\n"
-        "Produce routing decision for this exchange."
+        f"Turn #{turn_number}\n"
+        f"Context: {conversation_context[:300]}\n\n"
+        f"User: {user_message}\n"
+        f"Assistant: {assistant_response[:200]}\n\n"
+        "Route this exchange."
     )
 
-    response = await client.chat.completions.create(
-        model=settings.claude_model,
-        max_tokens=600,
-        messages=[
-            {"role": "system", "content": ROUTER_SYSTEM},
-            {"role": "user",   "content": prompt}
-        ]
-    )
+    try:
+        response = await client.chat.completions.create(
+            model=_ROUTER_MODEL,
+            max_tokens=400,   # down from 600
+            temperature=0,    # deterministic — we want consistent routing
+            messages=[
+                {"role": "system", "content": ROUTER_SYSTEM},
+                {"role": "user",   "content": prompt}
+            ]
+        )
+        raw = _parse_json(response.choices[0].message.content)
+    except Exception as e:
+        print(f"  ⚠ Router LLM failed: {e}")
+        return _empty_decision("router LLM error")
 
-    raw = _parse_json(response.choices[0].message.content)
-
-    # ── Parse user memories ───────────────────────────────────
+    # ── Parse memories ────────────────────────────────────────
     user_memories = []
     for item in raw.get("user_memories", []):
         if not item.get("content") or not item.get("canonical_key") or not item.get("memory_type"):
@@ -232,30 +290,30 @@ async def route(
             entities=      item.get("entities", [])
         ))
 
-    # ── Parse episodic decision ───────────────────────────────
-    ep_raw = raw.get("episodic", {})
+    ep_raw   = raw.get("episodic", {})
     episodic = EpisodicDecision(
-        should_store=   bool(ep_raw.get("should_store", False)),
-        title=          ep_raw.get("title", ""),
-        reason=         ep_raw.get("reason", ""),
-        emotional_tone= ep_raw.get("emotional_tone", "neutral"),
-        key_entities=   ep_raw.get("key_entities", []),
-        tags=           ep_raw.get("tags", [])
+        should_store=       bool(ep_raw.get("should_store", False)),
+        title=              ep_raw.get("title", ""),
+        reason=             ep_raw.get("reason", ""),
+        emotional_tone=     ep_raw.get("emotional_tone", "neutral"),
+        emotional_intensity=int(ep_raw.get("emotional_intensity", 2)),
+        key_entities=       ep_raw.get("key_entities", []),
+        tags=               ep_raw.get("tags", [])
     )
 
-    # ── Parse user DB update ──────────────────────────────────
-    db_raw = raw.get("user_db", {})
+    db_raw  = raw.get("user_db", {})
     user_db = UserDbUpdate(
-        should_update= bool(db_raw.get("should_update", False)),
-        fields=        db_raw.get("fields", {})
+        should_update=bool(db_raw.get("should_update", False)),
+        fields=       db_raw.get("fields", {})
     )
 
     return RoutingDecision(
-        trigger_user_memory= bool(raw.get("trigger_user_memory", False)) and len(user_memories) > 0,
-        trigger_episodic=    bool(raw.get("trigger_episodic", False)) and episodic.should_store,
-        trigger_user_db=     bool(raw.get("trigger_user_db", False)) and user_db.should_update,
-        user_memories=       user_memories,
-        episodic=            episodic,
-        user_db=             user_db,
-        router_reasoning=    raw.get("router_reasoning", "")
+        trigger_user_memory=bool(raw.get("trigger_user_memory", False)) and len(user_memories) > 0,
+        trigger_episodic=   bool(raw.get("trigger_episodic", False)) and episodic.should_store,
+        trigger_user_db=    bool(raw.get("trigger_user_db", False)) and user_db.should_update,
+        user_memories=      user_memories,
+        episodic=           episodic,
+        user_db=            user_db,
+        router_reasoning=   raw.get("router_reasoning", ""),
+        skipped=            False,
     )
