@@ -1,31 +1,28 @@
 """
-core/agent.py — Per-turn orchestrator with latency optimisations
+core/agent.py
 
-Latency optimisations applied
-──────────────────────────────
-  1. Background storage
-     Router + Neo4j writes + MongoDB writes + Summarization all run AFTER
-     the response is returned to the user. User never waits for storage.
-     Fire-and-forget via asyncio.create_task().
+KEY FIX (v3.2) — Why storage never ran before:
+───────────────────────────────────────────────
+  The SSE client in the UI closes the connection the moment it receives
+  the final "done: true" chunk. FastAPI then cancels the async generator.
+  asyncio.create_task(_background_store()) was at the END of the generator,
+  after yielding all tokens — so the client always disconnected first and
+  the task was never created. Nothing was ever stored.
 
-  2. Embed once
-     user_message is embedded ONCE in build_context(), the vector is
-     reused by Neo4j cache, MongoDB, and Redis. No duplicate API calls.
+  The fix: split chat_stream() into two functions:
+    1. stream_tokens()              — pure generator, only yields tokens
+    2. background_store_wrapper()   — registered via FastAPI BackgroundTasks
+                                      in server.py BEFORE returning the
+                                      StreamingResponse. Runs after the
+                                      response is fully sent, guaranteed,
+                                      even if the client disconnects early.
 
-  3. Neo4j 30s cache
-     Neo4j/Graphiti result cached in Redis for 30 seconds.
-     Cache hit: ~5ms instead of ~500ms.
-
-  4. Streaming support
-     chat_stream() yields tokens as they arrive from the LLM.
-     User sees first token in ~300ms instead of waiting 2-4 seconds.
-     Storage still happens in background after stream completes.
-
-  5. Background summarisation
-     Summarisation (L0/L1/L2/handoff) runs as a background task.
-     No longer blocks the response on summarisation turns.
+  The two functions share a `collected` dict that stream_tokens populates
+  with the full response text and context while streaming. background_store_wrapper
+  reads from it once streaming is done.
 """
 import asyncio
+import time
 from openai import AsyncOpenAI
 from config import get_settings
 from db import sqlite_manager as sql
@@ -59,74 +56,24 @@ Use the context below to personalise every response naturally:
 Answer the user's message helpfully, clearly, and concisely."""
 
 
-# ─── Main chat — returns full response immediately ────────────────────────────
+# ─── 1. Pure streaming generator ─────────────────────────────────────────────
+# Only job: build context, stream tokens, write results into `collected`.
+# Does NOT create any background tasks — server.py does that via BackgroundTasks.
 
-async def chat(user_id: str, session_id: str, user_message: str) -> dict:
+async def stream_tokens(
+    user_id: str,
+    session_id: str,
+    user_message: str,
+    collected: dict,          # shared dict — we populate, server.py reads
+):
     """
-    Full per-turn pipeline.
-
-    What the user waits for:
-      1. build_context()     — parallel fetch from all stores
-      2. LLM call            — generate response
-
-    What runs in background (user does NOT wait):
-      3. increment_session_turn()
-      4. route()             — router LLM call
-      5. store_memories()    — Neo4j writes
-      6. store_episodic()    — MongoDB write
-      7. save_turn()         — SQLite write
-      8. summarization       — L0/L1/L2/handoff
+    Pure token streaming generator. Populates `collected` dict with:
+      collected["full_response"] — complete assistant message
+      collected["context"]       — context dict from build_context()
     """
-
-    # ── 1. Build context (embed once, parallel fetch) ─────────
-    context     = await build_context(session_id, user_id, user_message)
-    context_str = format_context_for_prompt(context)
-
-    # ── 2. LLM response ───────────────────────────────────────
-    response = await _client.chat.completions.create(
-        model=settings.claude_model,
-        max_tokens=800,
-        messages=[
-            {"role": "system", "content": AGENT_SYSTEM.format(context_section=context_str)},
-            {"role": "user",   "content": user_message}
-        ]
-    )
-    assistant_message = response.choices[0].message.content
-
-    # ── 3. Fire background storage — user does NOT wait ───────
-    asyncio.create_task(
-        _background_store(
-            user_id=user_id,
-            session_id=session_id,
-            user_message=user_message,
-            assistant_message=assistant_message,
-            context=context,
-        )
-    )
-
-    return {
-        "response":    assistant_message,
-        "turn_number": None,   # filled after background task runs
-        "context_used": {
-            "memories_count":  len(context.get("memories", [])),
-            "episodic_count":  len(context.get("episodic_memories", [])),
-            "summaries_count": len(context.get("summaries", [])),
-            "raw_turns_count": len(context.get("raw_turns", [])),
-        }
-    }
-
-
-# ─── Streaming chat — yields tokens as they arrive ───────────────────────────
-
-async def chat_stream(user_id: str, session_id: str, user_message: str):
-    """
-    Streaming version — yields tokens as they arrive from the LLM.
-    Timing is logged to server console so latency is visible.
-    """
-    import time
     t0 = time.monotonic()
 
-    # ── 1. Build context ──────────────────────────────────────
+    # ── Build context ─────────────────────────────────────────
     context     = await build_context(session_id, user_id, user_message)
     context_str = format_context_for_prompt(context)
     t_ctx = time.monotonic()
@@ -136,7 +83,10 @@ async def chat_stream(user_id: str, session_id: str, user_message: str):
           f"redis={len(context.get('summaries',[]))} "
           f"sqlite={len(context.get('raw_turns',[]))}]")
 
-    # ── 2. Stream LLM response ────────────────────────────────
+    # Write context into shared dict immediately
+    collected["context"] = context
+
+    # ── Stream LLM response ───────────────────────────────────
     full_response  = ""
     first_token_at = None
     stream = await _client.chat.completions.create(
@@ -150,6 +100,8 @@ async def chat_stream(user_id: str, session_id: str, user_message: str):
     )
 
     async for chunk in stream:
+        if not chunk.choices:          # final [DONE] chunk from OpenRouter has empty choices
+            continue
         token = chunk.choices[0].delta.content or ""
         if token:
             if first_token_at is None:
@@ -159,21 +111,12 @@ async def chat_stream(user_id: str, session_id: str, user_message: str):
             full_response += token
             yield {"token": token}
 
-    t_end = time.monotonic()
-    print(f"  ⏱ stream_done:   {(t_end-t0)*1000:.0f}ms total")
+    # Write full response into shared dict
+    collected["full_response"] = full_response
 
-    # ── 3. Background storage — fire and forget ──────────────────
-    # Storage runs fully in background. User never waits for it.
-    # Badges/router log are populated by the UI's setTimeout refresh.
-    asyncio.create_task(
-        _background_store(
-            user_id=user_id,
-            session_id=session_id,
-            user_message=user_message,
-            assistant_message=full_response,
-            context=context,
-        )
-    )
+    t_end = time.monotonic()
+    print(f"  ⏱ stream_done:   {(t_end-t0)*1000:.0f}ms total  "
+          f"({len(full_response)} chars)")
 
     yield {
         "done": True,
@@ -186,7 +129,80 @@ async def chat_stream(user_id: str, session_id: str, user_message: str):
     }
 
 
-# ─── Background storage ───────────────────────────────────────────────────────
+# ─── 2. Background storage wrapper ───────────────────────────────────────────
+# Called by FastAPI BackgroundTasks in server.py — guaranteed to run after
+# the response is fully sent, even if the SSE client disconnects early.
+
+async def background_store_wrapper(
+    user_id: str,
+    session_id: str,
+    user_message: str,
+    collected: dict,
+):
+    """
+    Reads from `collected` (populated by stream_tokens) and runs all storage.
+    Called via FastAPI BackgroundTasks — never cancelled by client disconnect.
+    """
+    full_response = collected.get("full_response", "")
+    context       = collected.get("context")
+
+    if not full_response:
+        print("  ⚠ background_store: no response captured, skipping storage")
+        return
+    if context is None:
+        print("  ⚠ background_store: no context captured, skipping storage")
+        return
+
+    print(f"  → background_store starting for session {session_id[:8]}...")
+    await _background_store(
+        user_id=user_id,
+        session_id=session_id,
+        user_message=user_message,
+        assistant_message=full_response,
+        context=context,
+    )
+
+
+# ─── Non-streaming chat (sync endpoint) ──────────────────────────────────────
+
+async def chat(user_id: str, session_id: str, user_message: str) -> dict:
+    context     = await build_context(session_id, user_id, user_message)
+    context_str = format_context_for_prompt(context)
+
+    response = await _client.chat.completions.create(
+        model=settings.claude_model,
+        max_tokens=800,
+        messages=[
+            {"role": "system", "content": AGENT_SYSTEM.format(context_section=context_str)},
+            {"role": "user",   "content": user_message}
+        ]
+    )
+    assistant_message = response.choices[0].message.content
+
+    asyncio.create_task(
+        _background_store(
+            user_id=user_id,
+            session_id=session_id,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            context=context,
+        )
+    )
+
+    return {
+        "response":    assistant_message,
+        "turn_number": None,
+        "context_used": {
+            "memories_count":  len(context.get("memories", [])),
+            "episodic_count":  len(context.get("episodic_memories", [])),
+            "summaries_count": len(context.get("summaries", [])),
+            "raw_turns_count": len(context.get("raw_turns", [])),
+        }
+    }
+
+
+# ─── Core storage pipeline ───────────────────────────────────────────────────
+# Each store has its own try/except — one failure never blocks the others.
 
 async def _background_store(
     user_id: str,
@@ -195,10 +211,7 @@ async def _background_store(
     assistant_message: str,
     context: dict,
 ) -> dict:
-    """
-    All storage operations. Now returns a result dict so chat_stream
-    can include routing/episodic info in the SSE done chunk for UI badges.
-    """
+
     result = {
         "turn_number":     None,
         "routing":         {},
@@ -206,13 +219,22 @@ async def _background_store(
         "episodic_stored": None,
         "summarization":   None,
     }
-    try:
-        # Increment turn counter
-        turn_number    = await sql.increment_session_turn(session_id)
-        result["turn_number"] = turn_number
-        router_context = format_context_for_router(context)
 
-        # Router + summarization in parallel
+    # ── Step 1: SQLite turn counter ───────────────────────────
+    turn_number = None
+    try:
+        turn_number = await sql.increment_session_turn(session_id)
+        result["turn_number"] = turn_number
+        print(f"  ✓ SQLite turn counter: T{turn_number}")
+    except Exception as e:
+        print(f"  ✗ SQLite increment_session_turn FAILED: {e}")
+        return result
+
+    router_context = format_context_for_router(context)
+
+    # ── Step 2: Router + Summarization in parallel ────────────
+    decision = None
+    try:
         decision, summarization_result = await asyncio.gather(
             route(
                 user_message=user_message,
@@ -228,7 +250,28 @@ async def _background_store(
             return_exceptions=True
         )
 
-        # Save raw turn to SQLite
+        if isinstance(decision, Exception):
+            print(f"  ✗ Router FAILED: {decision}")
+            decision = None
+        else:
+            print(f"  ✓ Router: "
+                  f"mem={decision.trigger_user_memory} "
+                  f"ep={decision.trigger_episodic} "
+                  f"skipped={decision.skipped}")
+
+        if isinstance(summarization_result, Exception):
+            print(f"  ✗ Summarization FAILED: {summarization_result}")
+        elif summarization_result and summarization_result.get("summarized"):
+            result["summarization"] = summarization_result
+            print(f"  ✓ Summarization: "
+                  f"T{summarization_result.get('batch_start')}"
+                  f"-T{summarization_result.get('batch_end')}")
+
+    except Exception as e:
+        print(f"  ✗ Router/Summarization FAILED: {e}")
+
+    # ── Step 3: SQLite save_turn ──────────────────────────────
+    try:
         router_dict = decision.to_dict() if isinstance(decision, RoutingDecision) else {}
         await sql.save_turn(
             session_id=session_id,
@@ -238,18 +281,18 @@ async def _background_store(
             assistant_msg=assistant_message,
             router_decision=router_dict
         )
+        print(f"  ✓ SQLite save_turn: T{turn_number}")
+    except Exception as e:
+        print(f"  ✗ SQLite save_turn FAILED: {e}")
 
-        # Capture summarization result
-        if isinstance(summarization_result, dict) and summarization_result.get("summarized"):
-            result["summarization"] = summarization_result
+    if not isinstance(decision, RoutingDecision):
+        return result
 
-        if not isinstance(decision, RoutingDecision):
-            return result
+    result["routing"] = decision.to_dict()
 
-        result["routing"] = decision.to_dict()
-
-        # Neo4j — store facts via state machine
-        if decision.trigger_user_memory and decision.user_memories:
+    # ── Step 4: Neo4j ─────────────────────────────────────────
+    if decision.trigger_user_memory and decision.user_memories:
+        try:
             mem_list = [
                 {
                     "memory_type":   m.memory_type,
@@ -267,14 +310,18 @@ async def _background_store(
                 source_turn=turn_number
             )
             result["memories_stored"] = mem_list
-            # Invalidate Neo4j cache so next turn sees fresh facts
             await _invalidate_neo4j_cache(user_id)
+            print(f"  ✓ Neo4j: stored {len(mem_list)} memories")
+        except Exception as e:
+            print(f"  ✗ Neo4j FAILED: {e}")
+    else:
+        print(f"  · Neo4j: skipped "
+              f"(trigger={decision.trigger_user_memory}, "
+              f"count={len(decision.user_memories) if decision.user_memories else 0})")
 
-        # MongoDB — store episodic if significant
-        # NOTE: condition was previously `not isinstance(summarization_result, dict)`
-        # which blocked episodic on every summarization turn — wrong.
-        # Episodic and summarization are independent — both can trigger on same turn.
-        if decision.trigger_episodic and decision.episodic:
+    # ── Step 5: MongoDB ───────────────────────────────────────
+    if decision.trigger_episodic and decision.episodic:
+        try:
             from memory.extractor import create_episodic_narrative
             recent_turns  = context.get("raw_turns", [])
             episode_turns = recent_turns[-2:] + [{
@@ -306,15 +353,16 @@ async def _background_store(
                 importance_score=narrative.get("importance_score", 5.0),
             )
             result["episodic_stored"] = {"memory_id": ep_id, "title": narrative["title"]}
-
-    except Exception as e:
-        print(f"⚠ Background store error: {e}")
+            print(f"  ✓ MongoDB: [{narrative['title'][:40]}]")
+        except Exception as e:
+            print(f"  ✗ MongoDB FAILED: {e}")
+    else:
+        print(f"  · MongoDB: skipped (trigger={decision.trigger_episodic})")
 
     return result
 
 
 async def _invalidate_neo4j_cache(user_id: str):
-    """Delete the cached Neo4j result so next turn fetches fresh data."""
     try:
         from db.redis_manager import get_redis
         r = await get_redis()

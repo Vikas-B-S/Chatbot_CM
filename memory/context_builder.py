@@ -4,20 +4,23 @@ memory/context_builder.py — Context assembly with single shared query embeddin
 Key optimisations
 ─────────────────
   1. Embed once — query embedded ONE time upfront, vector passed to all stores.
-     Old code embedded the same message twice (Neo4j + Redis). Now: once.
+  2. Neo4j result cache — cached in Redis for 30s.
+  3. All 4 stores fetched in parallel via asyncio.gather.
+  4. Blind-spot fix — raw turns come from get_turns_from_last_summary().
 
-  2. Neo4j result cache — Neo4j/Graphiti is the slowest store (~200-800ms).
-     Facts rarely change turn-to-turn. Cache the result in Redis for 30s.
-     Cache miss → call Neo4j, store result. Cache hit → return in ~5ms.
-     Cache is invalidated automatically by TTL — no manual invalidation needed.
-
-  3. All 4 stores fetched in parallel via asyncio.gather — no sequential waits.
-
-  4. Blind-spot fix — raw turns come from get_turns_from_last_summary()
-     which returns everything since the last summarized batch, not just last N.
+Diagnostics
+───────────
+  Per-step timing is printed on every context build so you can see
+  exactly which store is slow. Look for lines like:
+    ⏱ [ctx] embed: 12ms
+    ⏱ [ctx] neo4j: 45ms   ← or 13000ms if Neo4j is the bottleneck
+    ⏱ [ctx] mongo: 8ms
+    ⏱ [ctx] redis: 6ms
+    ⏱ [ctx] sqlite: 3ms
 """
 import asyncio
 import json
+import time
 from config import get_settings
 from db import sqlite_manager as sql
 from db import neo4j_manager as neo4j
@@ -27,16 +30,10 @@ from db.embedder import embed_text
 
 settings = get_settings()
 
-# Neo4j cache TTL — 30s is short enough that new facts appear quickly
 _NEO4J_CACHE_TTL = 30
 
 
 def should_summarize(turn_number: int) -> tuple[bool, int, int]:
-    """
-    Pure function — no DB access needed.
-    Returns (trigger, batch_start, batch_end).
-    Turn 6→(True,1,3) | Turn 9→(True,4,6) | Turn 12→(True,7,9) ...
-    """
     if turn_number < settings.summarize_at_turn:
         return False, 0, 0
     offset = turn_number - settings.summarize_at_turn
@@ -49,11 +46,6 @@ def should_summarize(turn_number: int) -> tuple[bool, int, int]:
 
 
 async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
-    """
-    Neo4j with Redis-backed 30s cache.
-    Cache stores the direct (unranked) result. Ranking happens after cache hit
-    so we don't store query-specific orderings.
-    """
     from db.redis_manager import get_redis
     r         = await get_redis()
     cache_key = f"neo4j_cache:{user_id}"
@@ -62,19 +54,20 @@ async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
         cached = await r.get(cache_key)
         if cached:
             records = json.loads(cached)
-            # Re-rank cached results with current query_vec (local, ~1ms)
             if query_vec and records:
                 from db.neo4j_manager import _local_relevance_score
-                scored = sorted(records, key=lambda rec: _local_relevance_score(rec.get("content",""), query_vec), reverse=True)
+                scored = sorted(
+                    records,
+                    key=lambda rec: _local_relevance_score(rec.get("content", ""), query_vec),
+                    reverse=True
+                )
                 return scored
             return records
     except Exception:
         pass
 
-    # Cache miss — direct Cypher fetch (no remote embedding API)
     result = await neo4j.get_user_memories(user_id, query=query, query_vec=query_vec)
 
-    # Cache the unranked list (so different queries can re-rank it)
     try:
         await r.set(cache_key, json.dumps(result), ex=_NEO4J_CACHE_TTL)
     except Exception:
@@ -82,6 +75,60 @@ async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
 
     return result
 
+
+# ── Timed wrappers — each prints its own duration ─────────────────────────────
+
+async def _timed_neo4j(user_id, query, query_vec):
+    t = time.monotonic()
+    try:
+        result = await _get_neo4j_cached(user_id, query, query_vec)
+        print(f"  ⏱ [ctx] neo4j:  {(time.monotonic()-t)*1000:.0f}ms → {len(result)} memories")
+        return result
+    except Exception as e:
+        print(f"  ⏱ [ctx] neo4j:  {(time.monotonic()-t)*1000:.0f}ms → FAILED: {e}")
+        return []
+
+
+async def _timed_mongo(user_id, session_id, query, query_vec):
+    t = time.monotonic()
+    try:
+        result = await mongo.get_user_episodic_memories(
+            user_id, limit=5, session_id=session_id,
+            query=query or None, query_vec=query_vec
+        )
+        print(f"  ⏱ [ctx] mongo:  {(time.monotonic()-t)*1000:.0f}ms → {len(result)} episodes")
+        return result
+    except Exception as e:
+        print(f"  ⏱ [ctx] mongo:  {(time.monotonic()-t)*1000:.0f}ms → FAILED: {e}")
+        return []
+
+
+async def _timed_redis(session_id, user_id, query, query_vec):
+    t = time.monotonic()
+    try:
+        result = await redis_mgr.get_latest_summaries_for_context(
+            session_id, user_id=user_id,
+            query=query or None, query_vec=query_vec
+        )
+        print(f"  ⏱ [ctx] redis:  {(time.monotonic()-t)*1000:.0f}ms → {len(result)} summaries")
+        return result
+    except Exception as e:
+        print(f"  ⏱ [ctx] redis:  {(time.monotonic()-t)*1000:.0f}ms → FAILED: {e}")
+        return []
+
+
+async def _timed_sqlite(session_id):
+    t = time.monotonic()
+    try:
+        result = await sql.get_turns_from_last_summary(session_id)
+        print(f"  ⏱ [ctx] sqlite: {(time.monotonic()-t)*1000:.0f}ms → {len(result)} turns")
+        return result
+    except Exception as e:
+        print(f"  ⏱ [ctx] sqlite: {(time.monotonic()-t)*1000:.0f}ms → FAILED: {e}")
+        return []
+
+
+# ── Main context builder ───────────────────────────────────────────────────────
 
 async def build_context(
     session_id: str,
@@ -91,37 +138,36 @@ async def build_context(
     """
     Parallel fetch from all 4 stores with single shared query embedding.
     Embed once, pass vector to all stores — no duplicate API calls.
+    Per-step timing printed to console so slow stores are immediately visible.
     """
-    def safe(v):
-        return v if not isinstance(v, Exception) else []
+    t_total = time.monotonic()
 
+    # ── Embed query once ──────────────────────────────────────
     query_vec = None
     if user_message:
+        t_emb = time.monotonic()
         try:
             query_vec = await embed_text(user_message)
-        except Exception:
+            print(f"  ⏱ [ctx] embed:  {(time.monotonic()-t_emb)*1000:.0f}ms")
+        except Exception as e:
+            print(f"  ⏱ [ctx] embed:  FAILED: {e}")
             query_vec = None
 
-    results = await asyncio.gather(
-        _get_neo4j_cached(user_id, user_message, query_vec),
-        mongo.get_user_episodic_memories(
-            user_id, limit=5, session_id=session_id,
-            query=user_message or None, query_vec=query_vec
-        ),
-        redis_mgr.get_latest_summaries_for_context(
-            session_id, user_id=user_id,
-            query=user_message or None, query_vec=query_vec
-        ),
-        sql.get_turns_from_last_summary(session_id),
-        return_exceptions=True
+    # ── Parallel fetch — each store timed independently ───────
+    memories, episodic, summaries, raw_turns = await asyncio.gather(
+        _timed_neo4j(user_id, user_message, query_vec),
+        _timed_mongo(user_id, session_id, user_message, query_vec),
+        _timed_redis(session_id, user_id, user_message, query_vec),
+        _timed_sqlite(session_id),
     )
 
-    memories, episodic, summaries, raw_turns = results
+    print(f"  ⏱ [ctx] total:  {(time.monotonic()-t_total)*1000:.0f}ms")
+
     return {
-        "memories":          safe(memories),
-        "episodic_memories": safe(episodic),
-        "summaries":         safe(summaries),
-        "raw_turns":         safe(raw_turns),
+        "memories":          memories,
+        "episodic_memories": episodic,
+        "summaries":         summaries,
+        "raw_turns":         raw_turns,
         "query_vec":         query_vec,
     }
 
@@ -194,9 +240,9 @@ def format_context_for_prompt(context: dict) -> str:
 
 def format_context_for_router(context: dict) -> str:
     """Compact context for router's LLM call — last summary + last 2 turns."""
-    parts    = []
+    parts     = []
     summaries = context.get("summaries", [])
-    raw      = context.get("raw_turns", [])
+    raw       = context.get("raw_turns", [])
     if summaries:
         last = summaries[-1]
         parts.append(f"Recent summary: {last['summary_text'][:200]}")

@@ -504,7 +504,6 @@ header {
 .typing-dot:nth-child(2) { animation-delay: 0.2s; background: var(--text2); }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; background: var(--text3); }
 
-/* ── Streaming cursor ─────────────────────────────────────── */
 /* ── Markdown rendering ─────────────────────────────────── */
 .msg-bubble pre {
   background: #0a0f16; border: 1px solid var(--border2);
@@ -669,44 +668,44 @@ header {
 
 * { scrollbar-width: thin; scrollbar-color: var(--border2) transparent; }
 
-    /* ── Password strength ───────────────────────── */
-    .pw-rules {
-      margin-top: 6px;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 3px 12px;
-    }
-    .pw-rule {
-      font-size: 11px;
-      color: var(--text-dim, #666);
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      transition: color 0.2s;
-    }
-    .pw-rule::before {
-      content: "○";
-      font-size: 10px;
-    }
-    .pw-rule.pass {
-      color: #4caf82;
-    }
-    .pw-rule.pass::before {
-      content: "●";
-    }
-    .pw-strength-bar {
-      height: 3px;
-      border-radius: 2px;
-      margin-top: 8px;
-      background: #333;
-      overflow: hidden;
-    }
-    .pw-strength-fill {
-      height: 100%;
-      width: 0%;
-      border-radius: 2px;
-      transition: width 0.3s, background 0.3s;
-    }
+/* ── Password strength ───────────────────────── */
+.pw-rules {
+  margin-top: 6px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px 12px;
+}
+.pw-rule {
+  font-size: 11px;
+  color: var(--text-dim, #666);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  transition: color 0.2s;
+}
+.pw-rule::before {
+  content: "○";
+  font-size: 10px;
+}
+.pw-rule.pass {
+  color: #4caf82;
+}
+.pw-rule.pass::before {
+  content: "●";
+}
+.pw-strength-bar {
+  height: 3px;
+  border-radius: 2px;
+  margin-top: 8px;
+  background: #333;
+  overflow: hidden;
+}
+.pw-strength-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 2px;
+  transition: width 0.3s, background 0.3s;
+}
 
 </style>
 </head>
@@ -1046,14 +1045,12 @@ function initApp(user, session) {
   sessionId = session.session_id;
   turnCount = session.total_turns || 0;
 
-  // Add current session to list if not present
   if (!allSessions.find(s => s.session_id === session.session_id)) {
     allSessions.unshift(session);
   }
 
   document.getElementById('auth-overlay').style.display = 'none';
 
-  // Header
   document.getElementById('user-name-display').textContent = username;
   document.getElementById('user-avatar-text').textContent  = username.charAt(0).toUpperCase();
   document.getElementById('ud-name').textContent  = username;
@@ -1070,7 +1067,6 @@ function doLogout() {
   turnCount = 0; allSessions = [];
   allMemories = { fact:[], preference:[], goal:[], constraint:[] };
 
-  // Clear chat
   document.getElementById('messages').innerHTML = `
     <div class="welcome" id="welcome">
       <h2>Start a conversation</h2>
@@ -1083,19 +1079,15 @@ function doLogout() {
       </div>
     </div>`;
 
-  // Reset memory panel
   document.getElementById('memory-scroll').querySelectorAll('.memory-section').forEach(e => e.remove());
   document.getElementById('mem-empty').style.display = 'block';
   ['stat-facts','stat-prefs','stat-goals','stat-cons'].forEach(id => document.getElementById(id).textContent = '0');
 
-  // Reset episodic
   document.getElementById('episodic-scroll').querySelectorAll('.episodic-card').forEach(e => e.remove());
   document.getElementById('ep-empty').style.display = 'block';
 
-  // Reset router log
   document.getElementById('router-log-entries').innerHTML = '<div class="rl-entry" style="color:var(--text3)">awaiting first turn…</div>';
 
-  // Reset signin form
   document.getElementById('signin-email').value = '';
   document.getElementById('signin-password').value = '';
   document.getElementById('signup-email').value = '';
@@ -1116,7 +1108,6 @@ function doLogout() {
 function updateSessionPill() {
   const sess = allSessions.find(s => s.session_id === sessionId);
   document.getElementById('sp-name-display').textContent  = sess?.name || 'Session';
-  // Always use live turnCount — sess.total_turns is stale from login
   document.getElementById('sp-turns-display').textContent = `T${turnCount}`;
   renderSessionList();
 }
@@ -1145,7 +1136,6 @@ function switchToSession(sess) {
   sessionId = sess.session_id;
   turnCount = sess.total_turns || 0;
 
-  // Clear chat messages (session context is different)
   document.getElementById('messages').innerHTML = `
     <div style="text-align:center;padding:32px;font-family:var(--font-mono);font-size:11px;color:var(--text3)">
       // switched to ${sess.name || 'session'} · ${sess.total_turns || 0} turns
@@ -1172,7 +1162,6 @@ async function newSession(e) {
     sessionId = sess.session_id;
     turnCount = 0;
 
-    // Clear chat
     document.getElementById('messages').innerHTML = `
       <div class="welcome" id="welcome">
         <h2>Start a conversation</h2>
@@ -1214,7 +1203,6 @@ function closeUserDropdown() {
   document.getElementById('user-dropdown').classList.remove('open');
 }
 
-// Close dropdowns on outside click
 document.addEventListener('click', (e) => {
   if (!e.target.closest('#session-pill'))  closeSessionDropdown();
   if (!e.target.closest('#user-menu'))     closeUserDropdown();
@@ -1240,7 +1228,7 @@ async function sendMessage() {
   input.value = ''; input.style.height = 'auto';
   document.getElementById('send-btn').disabled = true;
 
-  addMessage('user', text, turnCount + 1);  // preview — finalise increments
+  addMessage('user', text, turnCount + 1);
   const typingId = addTyping();
 
   try {
@@ -1254,10 +1242,8 @@ async function sendMessage() {
       throw new Error(err.detail || 'API error');
     }
 
-    // ── Streaming SSE response ──────────────────────────────
     removeTyping(typingId);
 
-    // Create assistant message bubble immediately (empty)
     const msgId   = `msg-${Date.now()}`;
     addStreamingMessage(msgId);
 
@@ -1272,7 +1258,7 @@ async function sendMessage() {
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep incomplete line in buffer
+      buffer = lines.pop();
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
@@ -1280,26 +1266,31 @@ async function sendMessage() {
           const chunk = JSON.parse(line.slice(6));
 
           if (chunk.token) {
-            // Append token to message bubble in real time
             fullText += chunk.token;
             updateStreamingMessage(msgId, fullText);
           }
 
           if (chunk.done) {
-            // Stream complete — finalise message
             finaliseStreamingMessage(msgId, fullText, ++turnCount);
             document.getElementById('sp-turns-display').textContent = `T${turnCount}`;
             const sess = allSessions.find(s => s.session_id === sessionId);
             if (sess) sess.total_turns = turnCount;
 
-            // Storage runs in background on server (~1-2s after stream ends).
-            // After delay: refresh panels AND fetch routing info for badges/log.
+            // ── FIX: Poll multiple times to catch background storage ──
+            // Poll for background storage results.
+            // Stops as soon as turn_number is found (storage complete)
+            // or after 3 attempts (6s) — whichever comes first.
             const capturedMsgId = msgId;
-            setTimeout(async () => {
+            let pollAttempts = 0;
+            const pollInterval = setInterval(async () => {
+              pollAttempts++;
               loadMemories();
               loadEpisodic();
-              await loadLastTurnRouting(capturedMsgId);
-            }, 2500);
+              const turnData = await loadLastTurnRouting(capturedMsgId);
+              if ((turnData && turnData.turn_number) || pollAttempts >= 3) {
+                clearInterval(pollInterval);
+              }
+            }, 2000); // polls every 2s, stops early when data found
           }
 
           if (chunk.error) throw new Error(chunk.error);
@@ -1322,8 +1313,6 @@ function addStreamingMessage(msgId) {
   const div = document.createElement('div');
   div.className = 'message assistant';
   div.id = msgId;
-  // msg-meta must be present — without it the CSS selector
-  // .message.assistant .msg-bubble doesn't apply background correctly
   div.innerHTML = `
     <div class="msg-meta"><span>Synapse</span> <span class="turn-tag" id="${msgId}-turn"></span></div>
     <div class="msg-bubble streaming-bubble"><span class="stream-cursor">▋</span></div>`;
@@ -1348,7 +1337,6 @@ function finaliseStreamingMessage(msgId, text, turn) {
   if (!bubble) return;
   bubble.classList.remove('streaming-bubble');
   bubble.innerHTML = renderMarkdown(text);
-  // Fill in turn number now that we know it
   const turnTag = document.getElementById(`${msgId}-turn`);
   if (turnTag) turnTag.textContent = `T${turn}`;
   div.setAttribute('data-turn', turn);
@@ -1403,32 +1391,21 @@ function addMessage(role, text, turn, badges = []) {
   container.scrollTop = container.scrollHeight;
 }
 
-// Simple markdown renderer — bold, code, numbered/bullet lists
+// Simple markdown renderer
 function renderMarkdown(text) {
-  // Escape HTML first
   let html = text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
-  // Code blocks (must run before inline code)
   html = html.replace(/```[\w]*\n?([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
-
-  // Inline code
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-  // Bold and italic
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-  // List items
   html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
   html = html.replace(/^[-•]\s+(.+)$/gm, '<li>$1</li>');
-
-  // Wrap consecutive <li> tags in <ul>
   html = html.replace(/(<li>[\s\S]*?<\/li>)(\s*<li>[\s\S]*?<\/li>)*/g, m => '<ul>' + m + '</ul>');
 
-  // Line breaks (outside pre blocks)
   const parts = html.split(/(<pre>[\s\S]*?<\/pre>)/g);
   html = parts.map((part, i) =>
     i % 2 === 0 ? part.replace(/\n/g, '<br>') : part
@@ -1540,11 +1517,10 @@ async function loadEpisodic() {
 async function loadLastTurnRouting(msgId) {
   try {
     const res = await fetch(`${API}/sessions/${sessionId}/last_turn`);
-    if (!res.ok) return;
+    if (!res.ok) return null;
     const data = await res.json();
-    if (!data.turn_number) return;
+    if (!data.turn_number) return null;
 
-    // Add badges to the message bubble
     const badges = buildBadges(data);
     if (badges.length > 0) {
       const msgDiv = document.getElementById(msgId);
@@ -1561,7 +1537,8 @@ async function loadLastTurnRouting(msgId) {
       }
     }
     logRouter(data);
-  } catch(e) {}
+    return data;
+  } catch(e) { return null; }
 }
 
 // ── Router log ─────────────────────────────────────────────
