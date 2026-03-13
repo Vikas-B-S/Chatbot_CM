@@ -15,17 +15,24 @@ Two parallel systems work together:
      episode so Graphiti's hybrid search can find relevant memories during
      context building. Graphiti does NOT own state — we do.
 
-Why this hybrid approach
-────────────────────────
-Graphiti's automatic contradiction resolution is probabilistic — it uses an
-LLM to detect contradictions, which can miss things or create duplicates over
-long usage. For state that must be perfectly reliable (active/inactive,
-no duplicates, reactivation), direct Cypher is deterministic and guaranteed.
+Session-scoping rules
+─────────────────────
+  fact        → USER-scoped (universal across all sessions)
+                Always returned regardless of which session is active.
+                Examples: name, age, occupation, location
+
+  preference  → SESSION-scoped (only from current session)
+  goal        → SESSION-scoped (only from current session)
+  constraint  → SESSION-scoped (only from current session)
+                Returned only if their session_id matches the active session.
+                If a user re-states a preference in a new session, the node's
+                session_id is updated to the new session so it stays visible.
 
 MemoryRecord node schema
 ────────────────────────
   (:MemoryRecord {
     user_id:          string   — scopes to one user
+    session_id:       string   — session that last activated this record
     canonical_key:    string   — stable snake_case identifier e.g. "coding_language"
     memory_type:      string   — fact | preference | goal | constraint
     content:          string   — the actual memory text
@@ -40,24 +47,28 @@ MemoryRecord node schema
 State transition rules
 ──────────────────────
   NEW VALUE, NO HISTORY:
-    CREATE  MemoryRecord(status=active, version=1)
+    CREATE  MemoryRecord(status=active, version=1, session_id=current)
 
   EXACT DUPLICATE — same content_hash, already active:
-    SKIP    no write, no change
+    SKIP but UPDATE session_id to current (claims it for this session)
 
   EXACT DUPLICATE — same content_hash, currently inactive:
     REACTIVATE  deactivate current active for this key, reactivate this node
-                version += 1, deactivated_at = null
+                version += 1, session_id = current
 
   NEW VALUE — different content_hash, key exists:
     TRANSITION  deactivate all active for this key
-                CREATE new MemoryRecord(status=active, version=prev+1)
+                CREATE new MemoryRecord(status=active, version=prev+1, session_id=current)
 
-  Examples:
-    T1: "I love Python"   → Python: active   (v1)
-    T2: "switched to C++" → Python: inactive, C++: active (v2)
-    T3: "back to Python"  → C++: inactive, Python: REACTIVATED (same node, v+=1)
-    T4: "now using Rust"  → Python: inactive, Rust: active (v3)
+Cache invalidation fix (v3.3)
+─────────────────────────────
+  FIX: _invalidate_neo4j_cache() now accepts session_id and deletes the
+  correct key: neo4j_cache:{user_id}:{session_id}
+
+  Previously, the invalidation key was neo4j_cache:{user_id} but the
+  cache was stored under neo4j_cache:{user_id}:{session_id} — so
+  invalidation never actually deleted anything, causing stale data
+  to be served for up to 30 seconds after a memory write.
 """
 
 from __future__ import annotations
@@ -78,6 +89,9 @@ from config import get_settings
 settings = get_settings()
 _graphiti: Optional[Graphiti] = None
 _username_cache: dict[str, str] = {}
+
+# Memory types that are session-scoped (not universal)
+_SESSION_SCOPED_TYPES = {"preference", "goal", "constraint"}
 
 
 # ─── Graphiti lifecycle ───────────────────────────────────────────────────────
@@ -131,6 +145,11 @@ async def init_neo4j():
             "CREATE INDEX memory_record_type IF NOT EXISTS "
             "FOR (m:MemoryRecord) ON (m.user_id, m.memory_type, m.status)"
         )
+        # Index for session-scoped reads (preference/goal/constraint)
+        await s.run(
+            "CREATE INDEX memory_record_session IF NOT EXISTS "
+            "FOR (m:MemoryRecord) ON (m.user_id, m.session_id, m.memory_type, m.status)"
+        )
     print("✓ Graphiti (Neo4j) ready")
 
 
@@ -180,7 +199,7 @@ def _dedup_batch(memories: list[dict]) -> list[dict]:
 
 async def ensure_user_node(user_id: str, username: str):
     _username_cache[user_id] = username
-    g  = await _get_graphiti()
+    g      = await _get_graphiti()
     driver = g.driver
 
     async with driver.session() as s:
@@ -259,6 +278,8 @@ async def _process_one_memory(
 ) -> str | None:
     """
     State machine for a single memory.
+    session_id is stored on every node and updated whenever a node is
+    activated within a new session (so session-scoped reads stay current).
 
     Returns: episode_name (str) if written, None if skipped.
     """
@@ -280,12 +301,22 @@ async def _process_one_memory(
         # ── State 1: exact content already active? ────────────
         res = await s.run(
             "MATCH (m:MemoryRecord {user_id:$uid, content_hash:$h, status:'active'}) "
-            "RETURN m.canonical_key AS k LIMIT 1",
+            "RETURN m.canonical_key AS k, m.session_id AS sid LIMIT 1",
             uid=user_id, h=chash
         )
-        if await res.single():
-            print(f"  ↳ SKIP [{ckey}]: identical content already active")
-            return None  # Pure duplicate — nothing to do
+        existing_row = await res.single()
+        if existing_row:
+            # Already active — but update session_id so this session can see it
+            if existing_row["sid"] != session_id:
+                await s.run(
+                    "MATCH (m:MemoryRecord {user_id:$uid, content_hash:$h, status:'active'}) "
+                    "SET m.session_id = $sid, m.activated_at = $now",
+                    uid=user_id, h=chash, sid=session_id, now=now.isoformat()
+                )
+                print(f"  ↳ CLAIM [{ckey}]: re-stated in new session, session_id updated")
+            else:
+                print(f"  ↳ SKIP [{ckey}]: identical content already active this session")
+            return None  # No new Graphiti episode needed for a pure claim/skip
 
         # ── State 2: same content exists but inactive → REACTIVATE ──
         res = await s.run(
@@ -294,31 +325,29 @@ async def _process_one_memory(
             uid=user_id, h=chash
         )
         if await res.single():
-            # Deactivate whatever is currently active for this key
             await _deactivate_key(s, user_id, ckey, now)
-            # Reactivate this node
             await s.run(
                 """
                 MATCH (m:MemoryRecord {user_id:$uid, content_hash:$h})
                 SET m.status         = 'active',
+                    m.session_id     = $sid,
                     m.activated_at   = $now,
                     m.deactivated_at = null,
                     m.version        = m.version + 1
                 """,
-                uid=user_id, h=chash, now=now.isoformat()
+                uid=user_id, h=chash, sid=session_id, now=now.isoformat()
             )
             action = "reactivated"
-            print(f"  ↳ REACTIVATE [{ckey}]: previously known value restored")
+            print(f"  ↳ REACTIVATE [{ckey}]: previously known value restored (session {session_id[:8]})")
 
         else:
             # ── State 3/4: new content → TRANSITION or CREATE ────
-            # Get current max version for this key
             res = await s.run(
                 "MATCH (m:MemoryRecord {user_id:$uid, canonical_key:$key}) "
                 "RETURN max(m.version) AS v",
                 uid=user_id, key=ckey
             )
-            row = await res.single()
+            row   = await res.single()
             max_v = (row["v"] or 0) if row else 0
 
             deactivated = await _deactivate_key(s, user_id, ckey, now)
@@ -327,6 +356,7 @@ async def _process_one_memory(
                 """
                 CREATE (m:MemoryRecord {
                     user_id:        $uid,
+                    session_id:     $sid,
                     canonical_key:  $key,
                     memory_type:    $mtype,
                     content:        $content,
@@ -338,8 +368,8 @@ async def _process_one_memory(
                     deactivated_at: null
                 })
                 """,
-                uid=user_id, key=ckey, mtype=mtype, content=content,
-                chash=chash, ver=max_v + 1, now=now.isoformat()
+                uid=user_id, sid=session_id, key=ckey, mtype=mtype,
+                content=content, chash=chash, ver=max_v + 1, now=now.isoformat()
             )
             action = "updated" if deactivated else "created"
             print(f"  ↳ {action.upper()} [{ckey}] v{max_v+1}: {content[:70]}")
@@ -388,34 +418,32 @@ async def _deactivate_key(session, user_id: str, key: str, now: datetime) -> int
 
 async def get_user_memories(
     user_id: str,
+    session_id: str = None,
     memory_type: str = None,
     query: str = None,
-    query_vec: list = None,   # pre-computed local embedding — avoids all remote API calls
+    query_vec: list = None,
 ) -> list[dict]:
     """
-    Returns ACTIVE memories, ranked by local cosine similarity when query provided.
+    Returns ACTIVE memories with session-scoping:
+      - fact        → user-scoped (no session filter)
+      - preference  → session-scoped (session_id must match)
+      - goal        → session-scoped (session_id must match)
+      - constraint  → session-scoped (session_id must match)
 
-    IMPORTANT: We do NOT call Graphiti's g.search() here for context retrieval.
-    Graphiti uses OpenAIEmbedder → remote API call (~300ms) on every invocation.
-    Instead: fetch all active records via direct Cypher (~20ms), then rank
-    them locally using the pre-computed query_vec (~1ms cosine math).
+    When memory_type is None, returns facts (user-scoped) + session-scoped
+    prefs/goals/constraints for the given session_id.
 
-    Graphiti search is only used when WRITING memories (contradiction detection),
-    not when READING them for context.
+    Ranked by local cosine similarity when query_vec provided.
     """
-    records = await _get_memories_direct(user_id, memory_type)
+    records = await _get_memories_direct(user_id, session_id=session_id, memory_type=memory_type)
 
     if not records or not query_vec:
         return records
 
-    # Local cosine ranking — no API call, ~1ms
-    from db.embedder import cosine_similarity
+    # Local cosine ranking — no API call
     scored = []
     for r in records:
-        # Embed the content string for scoring
-        content = r.get("content", "")
-        # Use cached embedding if available, else score by text overlap heuristic
-        score = _local_relevance_score(content, query_vec)
+        score = _local_relevance_score(r.get("content", ""), query_vec)
         scored.append((score, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -423,82 +451,83 @@ async def get_user_memories(
 
 
 def _local_relevance_score(content: str, query_vec: list) -> float:
-    """
-    Fast local relevance scoring using pre-computed query_vec.
-    Embeds content synchronously (model already loaded) and computes cosine.
-    Falls back to 0.5 if embedding fails.
-    """
     try:
         from db.embedder import _get_model, cosine_similarity
-        model = _get_model()
+        model       = _get_model()
         content_vec = model.encode(content[:256], normalize_embeddings=True).tolist()
         return cosine_similarity(query_vec, content_vec)
     except Exception:
         return 0.5
 
 
-async def _get_memories_direct(user_id: str, memory_type: str = None) -> list[dict]:
+async def _get_memories_direct(
+    user_id: str,
+    session_id: str = None,
+    memory_type: str = None,
+) -> list[dict]:
+    """
+    Direct Cypher read with session-scoping logic:
+
+      If memory_type == 'fact' (or no type specified and we want all):
+        → facts: no session filter (user-wide)
+        → prefs/goals/constraints: session filter applied if session_id given
+
+      If memory_type is a specific session-scoped type:
+        → apply session filter
+    """
     driver = await _get_driver()
+
+    # Case 1: specific type requested
+    if memory_type:
+        is_session_scoped = memory_type in _SESSION_SCOPED_TYPES
+        async with driver.session() as s:
+            if is_session_scoped and session_id:
+                res = await s.run(
+                    "MATCH (m:MemoryRecord {user_id:$uid, status:'active', "
+                    "memory_type:$mtype, session_id:$sid}) "
+                    "RETURN m ORDER BY m.activated_at DESC",
+                    uid=user_id, mtype=memory_type, sid=session_id
+                )
+            else:
+                res = await s.run(
+                    "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:$mtype}) "
+                    "RETURN m ORDER BY m.activated_at DESC",
+                    uid=user_id, mtype=memory_type
+                )
+            records = await res.data()
+        return [_row_to_dict(r["m"]) for r in records]
+
+    # Case 2: all types — split query
+    # facts are user-scoped; prefs/goals/constraints are session-scoped
     async with driver.session() as s:
-        if memory_type:
+        # User-scoped facts (always returned)
+        res = await s.run(
+            "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:'fact'}) "
+            "RETURN m ORDER BY m.activated_at DESC",
+            uid=user_id
+        )
+        fact_records = await res.data()
+
+        # Session-scoped types
+        if session_id:
             res = await s.run(
-                "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:$mtype}) "
-                "RETURN m ORDER BY m.activated_at DESC",
-                uid=user_id, mtype=memory_type
+                "MATCH (m:MemoryRecord {user_id:$uid, status:'active', session_id:$sid}) "
+                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
+                "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
+                uid=user_id, sid=session_id
             )
         else:
+            # No session_id — return all (for admin/debug views)
             res = await s.run(
                 "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) "
+                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
                 "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
                 uid=user_id
             )
-        records = await res.data()
-    return [_row_to_dict(r["m"]) for r in records]
+        scoped_records = await res.data()
 
-
-async def _get_memories_semantic(
-    user_id: str, query: str, memory_type: str = None
-) -> list[dict]:
-    """Graphiti search → intersect with active MemoryRecord hashes."""
-    g = await _get_graphiti()
-    try:
-        edges = await g.search(query=query, group_ids=[user_id], num_results=15)
-    except Exception:
-        edges = []
-
-    # Get all active records for this user
-    driver = await _get_driver()
-    async with driver.session() as s:
-        res = await s.run(
-            "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) RETURN m",
-            uid=user_id
-        )
-        active = await res.data()
-
-    active_by_hash = {r["m"]["content_hash"]: r["m"] for r in active}
-
-    seen: set[str] = set()
-    results: list[dict] = []
-
-    for edge in edges:
-        fact = getattr(edge, "fact", "") or ""
-        if not fact or "unique identifier is" in fact:
-            continue
-        h = _content_hash(fact)
-        if h in active_by_hash and h not in seen:
-            seen.add(h)
-            rec = active_by_hash[h]
-            if memory_type and rec.get("memory_type") != memory_type:
-                continue
-            results.append(_row_to_dict(rec))
-
-    # Fallback if Graphiti matched nothing
-    if not results:
-        filtered = [r for r in active
-                    if not memory_type or r["m"].get("memory_type") == memory_type]
-        return [_row_to_dict(r["m"]) for r in filtered]
-
-    return results
+    all_records = fact_records + scoped_records
+    return [_row_to_dict(r["m"]) for r in all_records]
 
 
 def _row_to_dict(m: dict) -> dict:
@@ -506,6 +535,7 @@ def _row_to_dict(m: dict) -> dict:
         "content":        m.get("content", ""),
         "memory_type":    m.get("memory_type", "fact"),
         "canonical_key":  m.get("canonical_key", ""),
+        "session_id":     m.get("session_id", ""),
         "status":         m.get("status", "active"),
         "version":        m.get("version", 1),
         "activated_at":   m.get("activated_at"),
@@ -528,17 +558,8 @@ def _infer_type(fact: str) -> str:
 # ─── Timeline APIs ────────────────────────────────────────────────────────────
 
 async def get_fact_history(user_id: str, topic: str) -> list[dict]:
-    """
-    Full timeline for a topic — all versions, active and inactive, in order.
-
-    Shows Python→C++→Python (reactivation) as:
-      [ { content: "Python", status: active,   version: 3 }   ← reactivated
-        { content: "C++",    status: inactive, version: 2 }
-        { content: "Python", status: inactive, version: 1 } ]  ← original
-    """
     driver = await _get_driver()
     async with driver.session() as s:
-        # Try exact key first
         res = await s.run(
             "MATCH (m:MemoryRecord {user_id:$uid, canonical_key:$t}) "
             "RETURN m ORDER BY m.version DESC",
@@ -547,7 +568,6 @@ async def get_fact_history(user_id: str, topic: str) -> list[dict]:
         records = await res.data()
 
         if not records:
-            # Fuzzy content/key search
             res = await s.run(
                 "MATCH (m:MemoryRecord {user_id:$uid}) "
                 "WHERE toLower(m.content) CONTAINS toLower($t) "
@@ -561,6 +581,7 @@ async def get_fact_history(user_id: str, topic: str) -> list[dict]:
         "content":         r["m"].get("content", ""),
         "memory_type":     r["m"].get("memory_type", "fact"),
         "canonical_key":   r["m"].get("canonical_key", ""),
+        "session_id":      r["m"].get("session_id", ""),
         "status":          r["m"].get("status", "inactive"),
         "version":         r["m"].get("version", 1),
         "activated_at":    r["m"].get("activated_at"),
@@ -570,7 +591,6 @@ async def get_fact_history(user_id: str, topic: str) -> list[dict]:
 
 
 async def get_memory_timeline(user_id: str, canonical_key: str) -> dict:
-    """Structured timeline for one canonical_key with current value highlighted."""
     driver = await _get_driver()
     async with driver.session() as s:
         res = await s.run(
@@ -583,9 +603,17 @@ async def get_memory_timeline(user_id: str, canonical_key: str) -> dict:
     if not records:
         return {"canonical_key": canonical_key, "found": False}
 
-    versions = [{"version": r["m"]["version"], "content": r["m"]["content"],
-                 "status": r["m"]["status"], "activated_at": r["m"]["activated_at"],
-                 "deactivated_at": r["m"]["deactivated_at"]} for r in records]
+    versions = [
+        {
+            "version":        r["m"]["version"],
+            "content":        r["m"]["content"],
+            "status":         r["m"]["status"],
+            "session_id":     r["m"].get("session_id", ""),
+            "activated_at":   r["m"]["activated_at"],
+            "deactivated_at": r["m"]["deactivated_at"],
+        }
+        for r in records
+    ]
     active = next((v for v in versions if v["status"] == "active"), None)
 
     return {
@@ -601,17 +629,40 @@ async def get_memory_timeline(user_id: str, canonical_key: str) -> dict:
 
 # ─── Full profile ─────────────────────────────────────────────────────────────
 
-async def get_full_memory_graph(user_id: str) -> dict:
-    """Full memory profile: active memories + inactive counts per type."""
+async def get_full_memory_graph(user_id: str, session_id: str = None) -> dict:
+    """
+    Full memory profile with session-scoping applied.
+    facts   = all active for user (universal)
+    others  = only from current session_id (if provided)
+    """
     driver = await _get_driver()
     async with driver.session() as s:
+        # Facts — user-wide
         res = await s.run(
-            "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) "
-            "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
+            "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:'fact'}) "
+            "RETURN m ORDER BY m.activated_at DESC",
             uid=user_id
         )
-        active_records = await res.data()
+        fact_records = await res.data()
 
+        # Session-scoped types
+        if session_id:
+            res = await s.run(
+                "MATCH (m:MemoryRecord {user_id:$uid, status:'active', session_id:$sid}) "
+                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
+                "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
+                uid=user_id, sid=session_id
+            )
+        else:
+            res = await s.run(
+                "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) "
+                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
+                "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
+                uid=user_id
+            )
+        scoped_records = await res.data()
+
+        # Inactive counts (user-wide for history totals)
         res = await s.run(
             "MATCH (m:MemoryRecord {user_id:$uid, status:'inactive'}) "
             "RETURN m.memory_type AS mtype, count(m) AS cnt",
@@ -620,20 +671,23 @@ async def get_full_memory_graph(user_id: str) -> dict:
         inactive_raw = await res.data()
 
     inactive_counts = {r["mtype"]: r["cnt"] for r in inactive_raw}
-    by_type: dict[str, list] = {
-        "fact": [], "preference": [], "goal": [], "constraint": []
-    }
-    for r in active_records:
+    by_type: dict[str, list] = {"fact": [], "preference": [], "goal": [], "constraint": []}
+
+    for r in fact_records:
+        by_type["fact"].append(_row_to_dict(r["m"]))
+    for r in scoped_records:
         t = r["m"].get("memory_type", "fact")
         by_type.setdefault(t, []).append(_row_to_dict(r["m"]))
 
     return {
         "user_id":          user_id,
+        "session_id":       session_id,
         "memories_by_type": by_type,
         "active_totals":    {t: len(v) for t, v in by_type.items()},
         "inactive_totals":  inactive_counts,
         "total_active":     sum(len(v) for v in by_type.values()),
         "total_inactive":   sum(inactive_counts.values()),
+        "scope_note":       "facts=user-wide | preferences/goals/constraints=session-scoped",
         "engine":           "Hybrid: Direct Cypher state machine + Graphiti semantic search",
     }
 
@@ -644,9 +698,9 @@ async def delete_user_graph(user_id: str):
     g      = await _get_graphiti()
     driver = g.driver
     async with driver.session() as s:
-        await s.run("MATCH (m:MemoryRecord {user_id:$uid}) DELETE m",     uid=user_id)
-        await s.run("MATCH (u:UserProfile {user_id:$uid}) DELETE u",      uid=user_id)
-        await s.run("MATCH (e:Episodic {group_id:$gid}) DETACH DELETE e", gid=user_id)
+        await s.run("MATCH (m:MemoryRecord {user_id:$uid}) DELETE m",      uid=user_id)
+        await s.run("MATCH (u:UserProfile {user_id:$uid}) DELETE u",       uid=user_id)
+        await s.run("MATCH (e:Episodic {group_id:$gid}) DETACH DELETE e",  gid=user_id)
         await s.run("MATCH ()-[r:RELATES_TO {group_id:$gid}]-() DELETE r", gid=user_id)
         await s.run(
             "MATCH (n:Entity {group_id:$gid}) "
@@ -654,3 +708,29 @@ async def delete_user_graph(user_id: str):
             gid=user_id
         )
     _username_cache.pop(user_id, None)
+
+
+# ─── Cache invalidation ───────────────────────────────────────────────────────
+# FIX (v3.3): now accepts session_id to build the correct cache key.
+# Previously used neo4j_cache:{user_id} but cache was stored under
+# neo4j_cache:{user_id}:{session_id} — so invalidation never matched
+# and stale data persisted for the full 30s TTL after every memory write.
+
+async def invalidate_neo4j_cache(user_id: str, session_id: str):
+    """
+    Delete the Neo4j cache entry for this user+session.
+
+    Cache key format: neo4j_cache:{user_id}:{session_id}
+    This must exactly match the key written in context_builder.py:
+      cache_key = f"neo4j_cache:{user_id}:{session_id}"
+    """
+    try:
+        from db.redis_manager import get_redis
+        r = await get_redis()
+        deleted = await r.delete(f"neo4j_cache:{user_id}:{session_id}")
+        if deleted:
+            print(f"  ✓ Neo4j cache invalidated for {user_id[:8]}:{session_id[:8]}")
+        else:
+            print(f"  · Neo4j cache: no entry found to invalidate (already expired or never cached)")
+    except Exception as e:
+        print(f"  ⚠ Neo4j cache invalidation failed (non-fatal): {e}")

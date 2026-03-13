@@ -204,13 +204,17 @@ async def get_user(user_id: str):
     return u
 
 @app.get("/users/{user_id}/memory")
-async def get_user_memory(user_id: str, type: Optional[str] = Query(None)):
+async def get_user_memory(
+    user_id: str,
+    type: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+):
     if not await sql.get_user(user_id): raise HTTPException(404, "User not found")
     try:
         if type:
-            mems = await neo4j.get_user_memories(user_id, memory_type=type)
+            mems = await neo4j.get_user_memories(user_id, session_id=session_id, memory_type=type)
             return {"user_id": user_id, "type": type, "memories": mems, "count": len(mems)}
-        return await neo4j.get_full_memory_graph(user_id)
+        return await neo4j.get_full_memory_graph(user_id, session_id=session_id)
     except Exception as e:
         raise HTTPException(503, f"Neo4j unavailable: {e}")
 
@@ -234,10 +238,14 @@ async def memory_timeline(user_id: str, key: str):
     return await neo4j.get_memory_timeline(user_id, key)
 
 @app.get("/users/{user_id}/episodic")
-async def get_user_episodic(user_id: str, limit: int = 10):
+async def get_user_episodic(
+    user_id: str,
+    limit: int = 10,
+    session_id: Optional[str] = Query(None),
+):
     if not await sql.get_user(user_id): raise HTTPException(404, "User not found")
     try:
-        return await mongo.get_user_episodic_memories(user_id, limit=limit)
+        return await mongo.get_user_episodic_memories(user_id, limit=limit, session_id=session_id)
     except Exception as e:
         raise HTTPException(503, f"MongoDB unavailable: {e}")
 
@@ -290,6 +298,23 @@ async def get_session_summaries(session_id: str):
         }
     except Exception as e:
         raise HTTPException(503, f"Redis unavailable: {e}")
+
+
+
+@app.get("/sessions/{session_id}/turns")
+async def get_session_turns(session_id: str, limit: int = 50):
+    s = await sql.get_session(session_id)
+    if not s: raise HTTPException(404, "Session not found")
+    turns = await sql.get_last_n_turns(session_id, n=limit)
+    # Parse router_decision JSON strings
+    for t in turns:
+        if t.get("router_decision") and isinstance(t["router_decision"], str):
+            try:
+                import json
+                t["router_decision"] = json.loads(t["router_decision"])
+            except Exception:
+                pass
+    return {"session_id": session_id, "turns": turns, "count": len(turns)}
 
 @app.get("/sessions/{session_id}/context")
 async def get_session_context(session_id: str):

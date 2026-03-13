@@ -28,33 +28,23 @@ Each episodic memory document:
   created_at       datetime
   updated_at       datetime
 
+Session-scoping + cross-session fallback (v3.3)
+───────────────────────────────────────────────
+  get_user_episodic_memories(session_id=...) first tries to return
+  episodes from the current session only.
+
+  BUT — if fewer than _CROSS_SESSION_THRESHOLD episodes are found
+  (e.g. a brand new session with no episodes yet), it falls back to
+  returning the most important episodes across ALL sessions.
+
+  This ensures returning users always get useful episodic context
+  even at turn 1 of a new session, instead of an empty panel.
+
+  _CROSS_SESSION_THRESHOLD = 2  (fall back if fewer than 2 found)
+
 4-Component Retrieval Scoring
 ──────────────────────────────
   final = (0.50 × relevance) + (0.20 × recency) + (0.20 × importance) + (0.10 × access_freq)
-
-  relevance:    MongoDB $text score, normalised to [0,1]
-  recency:      exp(-days_old / 30) — 1.0 today, 0.37 at 30d, 0.05 at 90d
-  importance:   (importance_score - 1) / 9  normalised to [0,1]
-  access_freq:  log(1 + access_count), normalised across candidate pool
-
-  Why 4 components?
-  - Relevance alone misses important old episodes
-  - Recency alone misses important but not-recent episodes
-  - Importance ensures pivotal moments always surface
-  - Access frequency surfaces "sticky" memories the user returns to often
-
-Deduplication
-─────────────
-  content_hash = MD5(normalise(title + sorted(key_entities)))
-  If same hash within last 24h → SKIP (exact same event being written twice)
-  If same hash from earlier    → UPDATE access_count + last_accessed_at
-
-Consolidation
-─────────────
-  consolidate_old_episodes() merges episodes older than 90 days
-  with importance < 4 AND access_count < 2 into a single summary episode.
-  Source episodes are marked superseded=True (not deleted, just hidden from retrieval).
-  Run this periodically (e.g. once a week per user) or on demand.
 """
 
 import hashlib
@@ -71,12 +61,16 @@ from config import get_settings
 settings = get_settings()
 _client: Optional[AsyncIOMotorClient] = None
 
-# ── Scoring weights ──────────────────────────────────────────
 _W_RELEVANCE  = 0.50
 _W_RECENCY    = 0.20
 _W_IMPORTANCE = 0.20
 _W_ACCESS     = 0.10
 _RECENCY_HALF_LIFE = 30   # days
+
+# Cross-session fallback threshold (v3.3)
+# If fewer than this many episodes found in current session,
+# fall back to pulling top episodes across all sessions.
+_CROSS_SESSION_THRESHOLD = 2
 
 
 # ─── Connection ───────────────────────────────────────────────────────────────
@@ -92,30 +86,35 @@ def _col():
     return get_db()[settings.mongo_episodic_collection]
 
 
+async def _get_collection():
+    """Alias used by lifecycle.py consolidation helpers."""
+    return _col()
+
+
 async def init_mongo():
     col = _col()
 
-    # Operational indexes
     await col.create_index([("user_id", 1), ("created_at", -1)])
+    await col.create_index([("user_id", 1), ("session_id", 1), ("created_at", -1)])
     await col.create_index([("user_id", 1), ("topic_cluster", 1), ("created_at", -1)])
-    # Compound index: user_id → importance_score → created_at
-    # Covers the fallback sort — no full scan even with 100k episodes
-    await col.create_index([("user_id", 1), ("importance_score", -1), ("created_at", -1)], name="idx_user_importance_recency")
+    await col.create_index(
+        [("user_id", 1), ("importance_score", -1), ("created_at", -1)],
+        name="idx_user_importance_recency"
+    )
     await col.create_index([("user_id", 1), ("tags", 1)])
     await col.create_index([("user_id", 1), ("outcome", 1)])
     await col.create_index([("user_id", 1), ("content_hash", 1)])
     await col.create_index("memory_id", unique=True)
     await col.create_index([("session_id", 1)])
 
-    # Text search index with weights
     try:
         await col.create_index(
             [
-                ("title",        "text"),
-                ("content",      "text"),
-                ("tags",         "text"),
-                ("key_entities", "text"),
-                ("topic_cluster","text"),
+                ("title",         "text"),
+                ("content",       "text"),
+                ("tags",          "text"),
+                ("key_entities",  "text"),
+                ("topic_cluster", "text"),
             ],
             weights={
                 "title":         10,
@@ -127,7 +126,7 @@ async def init_mongo():
             name="episodic_text_search"
         )
     except Exception:
-        pass   # Already exists
+        pass
 
     print("✓ MongoDB ready")
 
@@ -149,13 +148,11 @@ def _normalise_text(text: str) -> str:
 
 
 def _make_content_hash(title: str, key_entities: list) -> str:
-    """Dedup key: normalised title + sorted entities."""
     raw = _normalise_text(title) + "|" + "|".join(sorted([e.lower() for e in key_entities]))
     return hashlib.md5(raw.encode()).hexdigest()
 
 
 def _recency_score(created_at: datetime) -> float:
-    """exp(-days / half_life). 1.0 today → 0.37 at 30d → 0.05 at 90d."""
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
     days = max((datetime.now(timezone.utc) - created_at).total_seconds() / 86400, 0)
@@ -175,6 +172,15 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _serialize(doc: dict) -> dict:
+    """Convert ObjectId and datetime for JSON serialisation."""
+    doc.pop("_id", None)
+    for k, v in doc.items():
+        if isinstance(v, datetime):
+            doc[k] = v.isoformat()
+    return doc
+
+
 # ─── Write ────────────────────────────────────────────────────────────────────
 
 async def store_episodic_memory(
@@ -191,13 +197,14 @@ async def store_episodic_memory(
     tags: list = None,
     topic_cluster: str = "",
     importance_score: float = 5.0,
+    embedding: list = None,   # optional pre-computed embedding (lifecycle use)
 ) -> str:
     """
     Write an episodic memory with full deduplication logic.
 
     Dedup behaviour:
-      SAME hash, created < 24h ago  → SKIP, return existing memory_id
-      SAME hash, created >= 24h ago → UPDATE access metadata, return existing id
+      SAME hash, created < 24h ago  → SKIP
+      SAME hash, created >= 24h ago → UPDATE access metadata
       NEW hash                       → INSERT new document
     """
     key_entities = key_entities or []
@@ -206,7 +213,6 @@ async def store_episodic_memory(
     chash        = _make_content_hash(title, key_entities)
     col          = _col()
 
-    # ── Dedup check ───────────────────────────────────────────
     existing = await col.find_one(
         {"user_id": user_id, "content_hash": chash},
         {"memory_id": 1, "created_at": 1}
@@ -215,11 +221,9 @@ async def store_episodic_memory(
     if existing:
         age_hours = (now - existing["created_at"].replace(tzinfo=timezone.utc)).total_seconds() / 3600
         if age_hours < 24:
-            # Very recent duplicate — skip entirely
             print(f"  ↳ SKIP episodic [{title[:40]}]: written < 24h ago")
             return existing["memory_id"]
         else:
-            # Older duplicate — bump access metadata to surface it again
             await col.update_one(
                 {"memory_id": existing["memory_id"]},
                 {"$inc": {"access_count": 1},
@@ -228,33 +232,32 @@ async def store_episodic_memory(
             print(f"  ↳ TOUCH episodic [{title[:40]}]: exists, refreshed access")
             return existing["memory_id"]
 
-    # ── Insert new ────────────────────────────────────────────
     memory_id = f"ep_{uuid.uuid4().hex[:16]}"
     doc = {
-        "memory_id":          memory_id,
-        "user_id":            user_id,
-        "session_id":         session_id,
-        "title":              title,
-        "content":            content,
-        "outcome":            outcome,
-        "outcome_note":       "",
-        "turn_start":         turn_start,
-        "turn_end":           turn_end,
-        "key_entities":       key_entities,
-        "emotional_tone":     emotional_tone,
+        "memory_id":           memory_id,
+        "user_id":             user_id,
+        "session_id":          session_id,
+        "title":               title,
+        "content":             content,
+        "outcome":             outcome,
+        "outcome_note":        "",
+        "turn_start":          turn_start,
+        "turn_end":            turn_end,
+        "key_entities":        key_entities,
+        "emotional_tone":      emotional_tone,
         "emotional_intensity": max(1, min(5, emotional_intensity)),
-        "tags":               tags,
-        "topic_cluster":      topic_cluster or _infer_cluster(tags, title),
-        "importance_score":   max(1.0, min(10.0, importance_score)),
-        "content_hash":       chash,
-        "access_count":       0,
-        "last_accessed_at":   now,
-        "related_ids":        [],
-        "is_summary":         False,
-        "source_ids":         [],
-        "superseded":         False,
-        "created_at":         now,
-        "updated_at":         now,
+        "tags":                tags,
+        "topic_cluster":       topic_cluster or _infer_cluster(tags, title),
+        "importance_score":    max(1.0, min(10.0, importance_score)),
+        "content_hash":        chash,
+        "access_count":        0,
+        "last_accessed_at":    now,
+        "related_ids":         [],
+        "is_summary":          False,
+        "source_ids":          [],
+        "superseded":          False,
+        "created_at":          now,
+        "updated_at":          now,
     }
     await col.insert_one(doc)
     doc.pop("_id", None)
@@ -263,17 +266,16 @@ async def store_episodic_memory(
 
 
 def _infer_cluster(tags: list, title: str) -> str:
-    """Simple rule-based cluster inference from tags and title."""
     combined = " ".join(tags).lower() + " " + title.lower()
     clusters = {
-        "career":      ["job", "work", "career", "salary", "interview", "promotion", "startup", "company"],
-        "health":      ["health", "medical", "doctor", "diet", "exercise", "mental", "sleep", "therapy"],
-        "learning":    ["learn", "study", "course", "skill", "book", "programming", "language", "tutorial"],
-        "finance":     ["money", "budget", "invest", "savings", "expense", "cost", "finance", "bank"],
-        "project":     ["project", "build", "launch", "product", "app", "deploy", "feature", "mvp"],
-        "relationship":["family", "friend", "partner", "colleague", "team", "social", "relationship"],
-        "travel":      ["travel", "trip", "visit", "country", "city", "flight", "hotel"],
-        "personal":    ["goal", "habit", "routine", "life", "personal", "growth", "motivation"],
+        "career":       ["job", "work", "career", "salary", "interview", "promotion", "startup", "company"],
+        "health":       ["health", "medical", "doctor", "diet", "exercise", "mental", "sleep", "therapy"],
+        "learning":     ["learn", "study", "course", "skill", "book", "programming", "language", "tutorial"],
+        "finance":      ["money", "budget", "invest", "savings", "expense", "cost", "finance", "bank"],
+        "project":      ["project", "build", "launch", "product", "app", "deploy", "feature", "mvp"],
+        "relationship": ["family", "friend", "partner", "colleague", "team", "social", "relationship"],
+        "travel":       ["travel", "trip", "visit", "country", "city", "flight", "hotel"],
+        "personal":     ["goal", "habit", "routine", "life", "personal", "growth", "motivation"],
     }
     for cluster, keywords in clusters.items():
         if any(k in combined for k in keywords):
@@ -289,19 +291,12 @@ async def update_episode_outcome(
     outcome_note: str = "",
     importance_boost: float = 0.0
 ) -> bool:
-    """
-    Update the outcome of an episode when it resolves.
-
-    Example: episode about "looking for a new job" stored as "ongoing"
-    → when user says "I got the job!", call:
-      update_episode_outcome(id, "resolved", "Got the job at XYZ in March")
-    """
-    col = _col()
+    col    = _col()
     update = {
         "$set": {
-            "outcome":     outcome,
+            "outcome":      outcome,
             "outcome_note": outcome_note,
-            "updated_at":  _now(),
+            "updated_at":   _now(),
         }
     }
     if importance_boost:
@@ -312,16 +307,9 @@ async def update_episode_outcome(
 
 
 async def link_related_episodes(memory_id_a: str, memory_id_b: str):
-    """Bidirectionally link two related episodes."""
     col = _col()
-    await col.update_one(
-        {"memory_id": memory_id_a},
-        {"$addToSet": {"related_ids": memory_id_b}}
-    )
-    await col.update_one(
-        {"memory_id": memory_id_b},
-        {"$addToSet": {"related_ids": memory_id_a}}
-    )
+    await col.update_one({"memory_id": memory_id_a}, {"$addToSet": {"related_ids": memory_id_b}})
+    await col.update_one({"memory_id": memory_id_b}, {"$addToSet": {"related_ids": memory_id_a}})
 
 
 # ─── Read ─────────────────────────────────────────────────────────────────────
@@ -331,56 +319,109 @@ async def get_user_episodic_memories(
     limit: int = 5,
     session_id: str = None,
     query: str = None,
-    query_vec: list = None,   # pre-computed embedding — skip embed call if provided
+    query_vec: list = None,
 ) -> list:
     """
-    Retrieve episodic memories using 4-component hybrid scoring.
+    Retrieve episodic memories for a user.
 
-    Score = (0.50 × relevance) + (0.20 × recency) + (0.20 × importance) + (0.10 × access_freq)
+    Session-scoping with cross-session fallback (v3.3):
+      Step 1 — Try current session first (focused, relevant)
+      Step 2 — If fewer than _CROSS_SESSION_THRESHOLD found,
+                fall back to top episodes across ALL sessions
+                ranked by importance + recency.
 
-    Each retrieval bumps access_count on returned documents so frequently
-    useful episodes naturally rise in future rankings.
+      This ensures new sessions always get useful episodic context
+      instead of an empty list. The fallback episodes are tagged
+      with their source session so the LLM knows they are from
+      previous conversations.
 
-    Excludes:
-      - superseded=True (consumed by consolidation summaries)
-      - is_summary=True from regular retrieval (summaries retrieved separately)
+    Scoring (when query provided):
+      (0.50 × relevance) + (0.20 × recency) + (0.20 × importance) + (0.10 × access_freq)
     """
-    col          = _col()
-    base_filter  = {"user_id": user_id, "superseded": {"$ne": True}}
+    col = _col()
 
-    if not query:
-        # Recency-only fallback (cold start / preview)
-        cursor = (
-            col.find(base_filter, {"_id": 0})
-               .sort([("importance_score", -1), ("created_at", -1)])
-               .limit(limit)
-        )
-        docs = await cursor.to_list(length=limit)
-        await _bump_access(col, [d["memory_id"] for d in docs])
-        return [_clean(d) for d in docs]
+    # Base filter — always exclude superseded
+    base_filter: dict = {"user_id": user_id, "superseded": {"$ne": True}}
 
-    # ── Text search candidates ────────────────────────────────
-    candidate_limit = limit * 5   # wider pool for better scoring
-    text_filter = {**base_filter, "$text": {"$search": query}}
-    cursor = (
-        col.find(text_filter, {"_id": 0, "score": {"$meta": "textScore"}})
-           .sort([("score", {"$meta": "textScore"})])
-           .limit(candidate_limit)
-    )
-    candidates = await cursor.to_list(length=candidate_limit)
+    # ── Step 1: try current session ───────────────────────────
+    session_docs = []
+    if session_id:
+        session_filter = {**base_filter, "session_id": session_id}
 
+        if not query:
+            cursor = (
+                col.find(session_filter, {"_id": 0})
+                   .sort([("importance_score", -1), ("created_at", -1)])
+                   .limit(limit)
+            )
+            session_docs = await cursor.to_list(length=limit)
+        else:
+            # Text search within this session
+            text_filter     = {**session_filter, "$text": {"$search": query}}
+            candidate_limit = limit * 5
+            cursor = (
+                col.find(text_filter, {"_id": 0, "score": {"$meta": "textScore"}})
+                   .sort([("score", {"$meta": "textScore"})])
+                   .limit(candidate_limit)
+            )
+            session_docs = await cursor.to_list(length=candidate_limit)
+            session_docs = _score_and_rank(session_docs, limit)
+
+    # ── Step 2: cross-session fallback ───────────────────────
+    # If current session has fewer than threshold episodes,
+    # pull top episodes from ALL sessions to fill the gap.
+    if len(session_docs) < _CROSS_SESSION_THRESHOLD:
+        needed        = limit - len(session_docs)
+        existing_ids  = {d["memory_id"] for d in session_docs}
+
+        # Exclude already-found episodes and current session (already searched)
+        fallback_filter = {
+            **base_filter,
+            "memory_id": {"$nin": list(existing_ids)},
+        }
+        if session_id:
+            # Exclude current session — already searched above
+            fallback_filter["session_id"] = {"$ne": session_id}
+
+        if not query:
+            cursor = (
+                col.find(fallback_filter, {"_id": 0})
+                   .sort([("importance_score", -1), ("created_at", -1)])
+                   .limit(needed)
+            )
+            fallback_docs = await cursor.to_list(length=needed)
+        else:
+            text_filter     = {**fallback_filter, "$text": {"$search": query}}
+            candidate_limit = needed * 5
+            cursor = (
+                col.find(text_filter, {"_id": 0, "score": {"$meta": "textScore"}})
+                   .sort([("score", {"$meta": "textScore"})])
+                   .limit(candidate_limit)
+            )
+            fallback_docs = await cursor.to_list(length=candidate_limit)
+            fallback_docs = _score_and_rank(fallback_docs, needed)
+
+        if fallback_docs:
+            print(f"  ↳ Episodic cross-session fallback: "
+                  f"{len(session_docs)} this session → "
+                  f"+{len(fallback_docs)} from previous sessions")
+
+        docs = session_docs + fallback_docs
+    else:
+        docs = session_docs
+
+    await _bump_access(col, [d["memory_id"] for d in docs])
+    return [_clean(d) for d in docs]
+
+
+def _score_and_rank(candidates: list, limit: int) -> list:
+    """
+    Apply 4-component scoring to text-search candidates and return top-k.
+    Used by both session and fallback retrieval paths.
+    """
     if not candidates:
-        # Fallback: importance + recency, no text match needed
-        cursor = (
-            col.find(base_filter, {"_id": 0})
-               .sort([("importance_score", -1), ("created_at", -1)])
-               .limit(limit)
-        )
-        docs = await cursor.to_list(length=limit)
-        await _bump_access(col, [d["memory_id"] for d in docs])
-        return [_clean(d) for d in docs]
+        return []
 
-    # ── Compute 4-component scores ────────────────────────────
     raw_text   = [c.get("score", 0.0) for c in candidates]
     recency    = [_recency_score(c["created_at"]) for c in candidates]
     importance = [(c.get("importance_score", 5.0) - 1) / 9 for c in candidates]
@@ -388,7 +429,6 @@ async def get_user_episodic_memories(
 
     norm_text   = _normalise_list(raw_text)
     norm_access = _normalise_list(access_raw)
-    # recency and importance are already in [0,1]
 
     for i, doc in enumerate(candidates):
         doc["_score"] = (
@@ -400,27 +440,20 @@ async def get_user_episodic_memories(
         doc.pop("score", None)
 
     candidates.sort(key=lambda x: x["_score"], reverse=True)
-    top = candidates[:limit]
-
-    # ── Bump access counts on returned docs ───────────────────
-    await _bump_access(col, [d["memory_id"] for d in top])
-
-    return [_clean(d) for d in top]
+    return candidates[:limit]
 
 
 async def _bump_access(col, memory_ids: list):
-    """Increment access_count and update last_accessed_at for retrieved docs."""
     if not memory_ids:
         return
     await col.update_many(
         {"memory_id": {"$in": memory_ids}},
-        {"$inc": {"access_count": 1},
-         "$set": {"last_accessed_at": _now()}}
+        {"$inc":  {"access_count": 1},
+         "$set":  {"last_accessed_at": _now()}}
     )
 
 
 def _clean(doc: dict) -> dict:
-    """Strip internal scoring fields before returning."""
     doc.pop("_score", None)
     doc.pop("_id", None)
     return doc
@@ -434,8 +467,7 @@ async def get_episodes_by_cluster(
     limit: int = 5,
     include_inactive: bool = False
 ) -> list:
-    """Get all episodes in a topic cluster, sorted by importance then recency."""
-    col = _col()
+    col  = _col()
     filt = {"user_id": user_id, "topic_cluster": cluster, "superseded": {"$ne": True}}
     if not include_inactive:
         filt["is_summary"] = {"$ne": True}
@@ -448,7 +480,6 @@ async def get_episodes_by_cluster(
 
 
 async def get_ongoing_episodes(user_id: str) -> list:
-    """All unresolved episodes — useful for proactively checking on open threads."""
     col = _col()
     cursor = (
         col.find(
@@ -460,8 +491,9 @@ async def get_ongoing_episodes(user_id: str) -> list:
     return await cursor.to_list(length=20)
 
 
-async def get_high_importance_episodes(user_id: str, min_importance: float = 7.0, limit: int = 5) -> list:
-    """Retrieve pivotal memories — always surface regardless of recency."""
+async def get_high_importance_episodes(
+    user_id: str, min_importance: float = 7.0, limit: int = 5
+) -> list:
     col = _col()
     cursor = (
         col.find(
@@ -497,32 +529,17 @@ async def consolidate_old_episodes(
     max_access_count: int = 2,
     dry_run: bool = False
 ) -> dict:
-    """
-    Merge low-value old episodes into a single summary episode per cluster.
-
-    Candidates: age > older_than_days AND importance < max_importance
-                AND access_count < max_access_count AND not already superseded
-
-    For each cluster with candidates:
-      1. Create one summary episode with a combined narrative
-      2. Mark all source episodes as superseded=True (hidden from retrieval)
-         They are NOT deleted — history is preserved, just excluded from results.
-
-    Returns: { "consolidated": N, "summaries_created": M, "clusters": [...] }
-
-    Run this once a week per active user, or on demand via admin endpoint.
-    """
-    col      = _col()
-    cutoff   = _now() - timedelta(days=older_than_days)
+    col     = _col()
+    cutoff  = _now() - timedelta(days=older_than_days)
 
     candidates = await col.find(
         {
-            "user_id":         user_id,
+            "user_id":          user_id,
             "importance_score": {"$lt": max_importance},
-            "access_count":    {"$lt": max_access_count},
-            "created_at":      {"$lt": cutoff},
-            "superseded":      {"$ne": True},
-            "is_summary":      {"$ne": True},
+            "access_count":     {"$lt": max_access_count},
+            "created_at":       {"$lt": cutoff},
+            "superseded":       {"$ne": True},
+            "is_summary":       {"$ne": True},
         },
         {"_id": 0}
     ).to_list(length=500)
@@ -530,24 +547,22 @@ async def consolidate_old_episodes(
     if not candidates:
         return {"consolidated": 0, "summaries_created": 0, "clusters": []}
 
-    # Group by topic_cluster
     by_cluster: dict[str, list] = {}
     for ep in candidates:
         c = ep.get("topic_cluster", "general")
         by_cluster.setdefault(c, []).append(ep)
 
-    # Only consolidate clusters with 3+ candidates (not worth it for 1-2)
     clusters_to_process = {c: eps for c, eps in by_cluster.items() if len(eps) >= 3}
 
     if not clusters_to_process:
         return {"consolidated": 0, "summaries_created": 0, "clusters": []}
 
-    consolidated_count  = 0
-    summaries_created   = 0
-    processed_clusters  = []
+    consolidated_count = 0
+    summaries_created  = 0
+    processed_clusters = []
+    summary_id         = "dry_run"
 
     for cluster, episodes in clusters_to_process.items():
-        # Build summary narrative from episode titles and outcomes
         episode_lines = [
             f"- {ep['title']} ({ep['outcome']}): {ep['content'][:120]}..."
             for ep in episodes
@@ -559,47 +574,41 @@ async def consolidate_old_episodes(
             f"{episodes[0]['created_at'].strftime('%b %Y')}.\n\n"
             + "\n".join(episode_lines)
         )
-        summary_title = f"[Summary] {cluster.title()} — {len(episodes)} episodes"
-
-        all_entities = list(set(
-            e for ep in episodes for e in ep.get("key_entities", [])
-        ))
-        all_tags = list(set(t for ep in episodes for t in ep.get("tags", [])))
+        summary_title  = f"[Summary] {cluster.title()} — {len(episodes)} episodes"
+        all_entities   = list(set(e for ep in episodes for e in ep.get("key_entities", [])))
+        all_tags       = list(set(t for ep in episodes for t in ep.get("tags", [])))
         avg_importance = sum(ep.get("importance_score", 5) for ep in episodes) / len(episodes)
-        source_ids = [ep["memory_id"] for ep in episodes]
+        source_ids     = [ep["memory_id"] for ep in episodes]
 
         if not dry_run:
-            # Create summary episode
             summary_id = f"ep_{uuid.uuid4().hex[:16]}"
             now = _now()
             await col.insert_one({
-                "memory_id":          summary_id,
-                "user_id":            user_id,
-                "session_id":         "consolidation",
-                "title":              summary_title,
-                "content":            summary_content,
-                "outcome":            "resolved",
-                "outcome_note":       f"Auto-consolidated {len(episodes)} episodes",
-                "turn_start":         episodes[-1].get("turn_start", 0),
-                "turn_end":           episodes[0].get("turn_end", 0),
-                "key_entities":       all_entities[:20],
-                "emotional_tone":     "neutral",
+                "memory_id":           summary_id,
+                "user_id":             user_id,
+                "session_id":          "consolidation",
+                "title":               summary_title,
+                "content":             summary_content,
+                "outcome":             "resolved",
+                "outcome_note":        f"Auto-consolidated {len(episodes)} episodes",
+                "turn_start":          episodes[-1].get("turn_start", 0),
+                "turn_end":            episodes[0].get("turn_end", 0),
+                "key_entities":        all_entities[:20],
+                "emotional_tone":      "neutral",
                 "emotional_intensity": 1,
-                "tags":               all_tags[:15],
-                "topic_cluster":      cluster,
-                "importance_score":   max(avg_importance, 4.0),
-                "content_hash":       _make_content_hash(summary_title, all_entities),
-                "access_count":       0,
-                "last_accessed_at":   now,
-                "related_ids":        [],
-                "is_summary":         True,
-                "source_ids":         source_ids,
-                "superseded":         False,
-                "created_at":         now,
-                "updated_at":         now,
+                "tags":                all_tags[:15],
+                "topic_cluster":       cluster,
+                "importance_score":    max(avg_importance, 4.0),
+                "content_hash":        _make_content_hash(summary_title, all_entities),
+                "access_count":        0,
+                "last_accessed_at":    now,
+                "related_ids":         [],
+                "is_summary":          True,
+                "source_ids":          source_ids,
+                "superseded":          False,
+                "created_at":          now,
+                "updated_at":          now,
             })
-
-            # Mark source episodes as superseded
             await col.update_many(
                 {"memory_id": {"$in": source_ids}},
                 {"$set": {"superseded": True, "updated_at": now}}
@@ -610,21 +619,20 @@ async def consolidate_old_episodes(
         processed_clusters.append({
             "cluster":    cluster,
             "episodes":   len(episodes),
-            "summary_id": summary_id if not dry_run else "dry_run"
+            "summary_id": summary_id,
         })
 
     return {
-        "consolidated":       consolidated_count,
-        "summaries_created":  summaries_created,
-        "clusters":           processed_clusters,
-        "dry_run":            dry_run,
+        "consolidated":      consolidated_count,
+        "summaries_created": summaries_created,
+        "clusters":          processed_clusters,
+        "dry_run":           dry_run,
     }
 
 
 # ─── Stats & admin ────────────────────────────────────────────────────────────
 
 async def get_episodic_stats(user_id: str) -> dict:
-    """Usage statistics for the memory panel."""
     col = _col()
 
     total      = await col.count_documents({"user_id": user_id})
@@ -633,7 +641,6 @@ async def get_episodic_stats(user_id: str) -> dict:
     ongoing    = await col.count_documents({"user_id": user_id, "outcome": "ongoing", "superseded": {"$ne": True}})
     summaries  = await col.count_documents({"user_id": user_id, "is_summary": True})
 
-    # Cluster distribution
     pipeline = [
         {"$match": {"user_id": user_id, "superseded": {"$ne": True}}},
         {"$group": {"_id": "$topic_cluster", "count": {"$sum": 1},
@@ -642,7 +649,6 @@ async def get_episodic_stats(user_id: str) -> dict:
     ]
     clusters = await col.aggregate(pipeline).to_list(length=20)
 
-    # Most accessed
     top_accessed = await (
         col.find({"user_id": user_id, "superseded": {"$ne": True}},
                  {"_id": 0, "title": 1, "access_count": 1, "importance_score": 1})
@@ -651,11 +657,11 @@ async def get_episodic_stats(user_id: str) -> dict:
     ).to_list(length=5)
 
     return {
-        "total_episodes":      total,
-        "active_episodes":     active,
-        "superseded_episodes": superseded,
-        "ongoing_episodes":    ongoing,
-        "summary_episodes":    summaries,
+        "total_episodes":       total,
+        "active_episodes":      active,
+        "superseded_episodes":  superseded,
+        "ongoing_episodes":     ongoing,
+        "summary_episodes":     summaries,
         "cluster_distribution": [
             {"cluster": c["_id"], "count": c["count"],
              "avg_importance": round(c["avg_importance"], 1)}
@@ -663,6 +669,42 @@ async def get_episodic_stats(user_id: str) -> dict:
         ],
         "most_accessed": top_accessed,
     }
+
+
+# ─── Lifecycle helpers (used by memory/lifecycle.py) ─────────────────────────
+
+async def get_episodes_for_consolidation(
+    user_id: str,
+    older_than: datetime,
+    max_importance: float = 7.9
+) -> list:
+    """Returns old low-importance episodes eligible for lifecycle consolidation."""
+    col    = _col()
+    cursor = col.find({
+        "user_id":          user_id,
+        "created_at":       {"$lt": older_than},
+        "importance_score": {"$lte": max_importance},
+        "tags":             {"$nin": ["consolidated"]},
+        "superseded":       {"$ne": True},
+    }).sort("created_at", 1)
+    docs = await cursor.to_list(length=500)
+    return [_serialize(d) for d in docs]
+
+
+async def delete_episodes_by_ids(user_id: str, memory_ids: list) -> int:
+    """Delete specific episodes by ID — only for this user (safety check)."""
+    from bson import ObjectId
+    col       = _col()
+    valid_ids = []
+    for mid in memory_ids:
+        try:
+            valid_ids.append(ObjectId(mid))
+        except Exception:
+            continue
+    if not valid_ids:
+        return 0
+    result = await col.delete_many({"_id": {"$in": valid_ids}, "user_id": user_id})
+    return result.deleted_count
 
 
 # ─── Delete ───────────────────────────────────────────────────────────────────

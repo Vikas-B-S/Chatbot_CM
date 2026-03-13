@@ -28,6 +28,26 @@ Blind-spot fix
     get_turns_from_last_summary() returns T43-T50 (everything since last batch)
     context_builder merges this with the raw window
     blind spot eliminated regardless of batch size or timing
+
+Raw turn cap (v3.3)
+───────────────────
+  get_turns_from_last_summary() now enforces a hard cap of
+  _RAW_TURN_CAP = 20 most recent turns.
+
+  WHY: Without a cap, a long session where summarization is behind
+  (or never triggered) returns ALL unsummarized turns — potentially
+  50-100 turns dumped raw into the prompt.
+
+    50 turns × ~200 tokens each = ~10,000 tokens just from raw history
+    → LLM context window fills up
+    → Older summaries and memory get pushed out
+    → Cost spikes with no quality benefit
+
+  With the cap: only the 20 most recent turns are shown verbatim.
+  Summaries already cover older turns — they don't need to appear raw.
+
+  The cap is applied AFTER ordering by turn_number DESC so we always
+  keep the MOST RECENT turns, not the oldest.
 """
 
 import aiosqlite
@@ -42,6 +62,10 @@ from typing import Optional
 from config import get_settings
 
 settings = get_settings()
+
+# Hard cap on raw turns returned by get_turns_from_last_summary()
+# Prevents prompt bloat when summarization is behind on long sessions.
+_RAW_TURN_CAP = 20
 
 
 def get_db():
@@ -326,32 +350,58 @@ async def get_last_n_turns(session_id: str, n: int = 6) -> list:
 
 async def get_turns_from_last_summary(session_id: str) -> list:
     """
-    Returns all turns AFTER the last summarized batch.
+    Returns turns AFTER the last summarized batch, capped at _RAW_TURN_CAP.
 
-    This is the blind-spot fix. Instead of only showing last N turns,
-    context_builder calls this to get everything since the last Redis summary.
-    Ensures no turns fall into the gap between 'already summarized' and
-    'inside raw window'.
+    FIX (v3.3): Added hard cap of _RAW_TURN_CAP (20) most recent turns.
 
-    Example:
+    WHY THE CAP:
+      Without it, a session where summarization is delayed returns ALL
+      unsummarized turns — potentially 50-100 turns dumped raw into the
+      prompt. At ~200 tokens per turn that's 10,000+ tokens of raw history
+      which crowds out summaries, memories, and episodic context.
+
+    HOW IT WORKS:
+      1. Find the last summarized turn number
+      2. Fetch ALL turns after it ordered DESC (newest first)
+      3. Take only the first _RAW_TURN_CAP rows (most recent)
+      4. Reverse to chronological order for the prompt
+
+    This means if there are 40 unsummarized turns (T10-T50):
+      Old: returns all 40 turns
+      New: returns turns T31-T50 (the 20 most recent)
+      Turns T10-T30 are not lost — they'll be summarized next cycle.
+
+    Example (blind-spot fix still works with cap):
       Last summarized: turn 42
       Total turns: 50
-      Returns: turns 43, 44, 45, 46, 47, 48, 49, 50
+      Cap: 20
+      Returns: turns 43-50 (8 turns — well within cap, all returned)
+
+    Example (cap kicks in for long unsummarized session):
+      Last summarized: turn 5
+      Total turns: 50
+      Cap: 20
+      Returns: turns 31-50 (20 most recent turns, not all 45)
     """
     last_summarized = await get_last_summarized_turn(session_id)
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT * FROM turn_logs WHERE session_id=? AND turn_number > ? "
-            "ORDER BY turn_number ASC",
-            (session_id, last_summarized)
+            # ORDER BY DESC + LIMIT = get the most recent _RAW_TURN_CAP turns
+            # Then we reverse below to restore chronological order
+            "SELECT * FROM turn_logs "
+            "WHERE session_id=? AND turn_number > ? "
+            "ORDER BY turn_number DESC LIMIT ?",
+            (session_id, last_summarized, _RAW_TURN_CAP)
         )
         rows = await cur.fetchall()
-    return [dict(r) for r in rows]
+    # Reverse: DESC fetch gives newest-first, prompt needs oldest-first
+    return [dict(r) for r in reversed(rows)]
 
 
 async def get_unsummarized_turns(session_id: str) -> list:
-    """All turns not yet summarized — used by summarizer to find pending batches."""
+    """All turns not yet summarized — used by summarizer to find pending batches.
+    Note: intentionally has NO cap — summarizer needs the full list to batch correctly."""
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(

@@ -3,9 +3,31 @@ memory/extractor.py
 LLM calls for conversation summarization only.
 Memory extraction decisions are handled by core/router.py.
 
+Model strategy (v3.3)
+─────────────────────
+  All 5 LLM calls in this file now use settings.extractor_model
+  instead of settings.claude_model.
+
+  WHY: Every function here is a structured JSON extraction task —
+  the prompt has a clear schema, the output is short, and the content
+  is formulaic (summaries, compressions, narratives). These tasks do
+  NOT need a powerful model. They need a fast, cheap one.
+
+  settings.extractor_model defaults to "openai/gpt-4o-mini":
+    summarize_turns()          → L0 batch summary       (300 tokens max)
+    compress_summaries()       → L1 window compression  (250 tokens max)
+    compress_to_arc()          → L2 arc compression     (300 tokens max)
+    create_handoff_summary()   → cross-session handoff  (200 tokens max)
+    create_episodic_narrative()→ episodic narrative     (350 tokens max)
+
+  The main model (settings.claude_model) is reserved exclusively for
+  user-facing responses in core/agent.py.
+
 Functions:
   summarize_turns()      → level-0 summary (Redis)
   compress_summaries()   → level-1 meta-summary (Redis)
+  compress_to_arc()      → level-2 arc summary (Redis)
+  create_handoff_summary() → cross-session handoff (Redis)
   create_episodic_memory() → rich narrative from turns (MongoDB)
 """
 import json
@@ -57,14 +79,17 @@ Return ONLY JSON (no markdown):
 
 
 async def summarize_turns(turns: list[dict]) -> dict:
-    """Summarise a batch of raw turns → level-0 summary for Redis."""
+    """
+    Summarise a batch of raw turns → level-0 summary for Redis.
+    Uses extractor_model (cheap/fast) — structured JSON task, no need for main model.
+    """
     client = get_client()
     text = "\n\n".join([
         f"[Turn {t['turn_number']}]\nUser: {t['user_msg']}\nAssistant: {t['assistant_msg']}"
         for t in turns
     ])
     response = await client.chat.completions.create(
-        model=settings.claude_model,
+        model=settings.extractor_model,   # ← was settings.claude_model
         max_tokens=300,
         messages=[
             {"role": "system", "content": SUMMARIZATION_SYSTEM},
@@ -99,7 +124,7 @@ Return ONLY JSON (no markdown):
 async def compress_summaries(summaries: list[dict]) -> dict:
     """
     Compress a list of L0 summaries into one L1 summary.
-    Accepts a list (replaces old 2-arg signature).
+    Uses extractor_model (cheap/fast) — merging text, no reasoning needed.
     """
     client = get_client()
     parts = []
@@ -110,7 +135,7 @@ async def compress_summaries(summaries: list[dict]) -> dict:
     prompt = "Compress these sequential summaries into one:\n\n" + "\n\n".join(parts)
 
     response = await client.chat.completions.create(
-        model=settings.claude_model,
+        model=settings.extractor_model,   # ← was settings.claude_model
         max_tokens=250,
         messages=[
             {"role": "system", "content": L1_COMPRESSION_SYSTEM},
@@ -149,7 +174,8 @@ Return ONLY JSON (no markdown):
 async def compress_to_arc(summaries: list[dict]) -> dict:
     """
     Compress L1 summaries into one L2 arc summary.
-    Higher level of abstraction — captures the arc, not the details.
+    Uses extractor_model (cheap/fast) — higher abstraction but still
+    structured compression, not open-ended reasoning.
     """
     client = get_client()
     parts = []
@@ -161,7 +187,7 @@ async def compress_to_arc(summaries: list[dict]) -> dict:
     prompt = "Compress into one high-level session arc:\n\n" + "\n\n".join(parts)
 
     response = await client.chat.completions.create(
-        model=settings.claude_model,
+        model=settings.extractor_model,   # ← was settings.claude_model
         max_tokens=300,
         messages=[
             {"role": "system", "content": ARC_COMPRESSION_SYSTEM},
@@ -198,7 +224,8 @@ Return ONLY JSON (no markdown):
 async def create_handoff_summary(best_summary: dict) -> dict:
     """
     Turn the best available session summary into a cross-session handoff.
-    Written in second person — shown at top of next session.
+    Uses extractor_model (cheap/fast) — templated 3-sentence output,
+    no complex reasoning required.
     """
     client = get_client()
     prompt = (
@@ -208,7 +235,7 @@ async def create_handoff_summary(best_summary: dict) -> dict:
         "Write a handoff for the next session."
     )
     response = await client.chat.completions.create(
-        model=settings.claude_model,
+        model=settings.extractor_model,   # ← was settings.claude_model
         max_tokens=200,
         messages=[
             {"role": "system", "content": HANDOFF_SYSTEM},
@@ -223,7 +250,7 @@ async def create_handoff_summary(best_summary: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. EPISODIC MEMORY NARRATIVE → MongoDB
+# 5. EPISODIC MEMORY NARRATIVE → MongoDB
 # ═══════════════════════════════════════════════════════════════
 
 EPISODIC_SYSTEM = """You write rich episodic memory records for an AI assistant.
@@ -232,15 +259,15 @@ These help future AI instances understand what happened, why, and what was resol
 Write in third-person. Cover: situation, challenge, approach taken, resolution/outcome,
 emotional arc, any open threads.
 
+You will be given pre-computed metadata (importance, tone, entities, cluster) from the
+router — treat these as ground truth. Do NOT re-derive them. Your job is ONLY to write
+the narrative title, content, and outcome.
+
 Return ONLY JSON (no markdown):
 {
   "title": "Short evocative title, max 8 words",
   "content": "Rich 4-6 sentence narrative. Be specific — name the tools, concepts, decisions involved.",
-  "outcome": "resolved|ongoing|abandoned|unclear",
-  "importance_score": <float 1.0-10.0 — how significant is this for understanding the user?
-    1-3: trivial small talk | 4-6: useful context | 7-8: significant event | 9-10: pivotal/life-changing>,
-  "emotional_intensity": <int 1-5 — 1=neutral, 3=moderate, 5=very strong emotion>,
-  "topic_cluster": "<one of: career|health|learning|finance|project|relationship|travel|personal|general>"
+  "outcome": "resolved|ongoing|abandoned|unclear"
 }"""
 
 
@@ -250,31 +277,58 @@ async def create_episodic_narrative(
 ) -> dict:
     """
     Build a rich episodic narrative from a batch of turns.
-    episodic_decision comes from the router (has tone, entities, tags).
+    Uses extractor_model (cheap/fast) — pure writing task, NOT a reasoning task.
+
+    Router value passthrough (v3.3):
+      The router already computed importance_score, emotional_tone,
+      emotional_intensity, key_entities, and topic_cluster.
+      These are passed directly into the return value — the LLM is NOT
+      asked to re-derive them. This avoids paying twice for the same work.
+
+      LLM now only produces: title, content, outcome (3 fields instead of 6).
+      Router provides:        importance_score, emotional_tone,
+                              emotional_intensity, topic_cluster, key_entities.
+
+      max_tokens reduced 350 → 200 (LLM output is now much smaller).
     """
     client = get_client()
     text = "\n\n".join([
         f"[Turn {t['turn_number']}]\nUser: {t['user_msg']}\nAssistant: {t['assistant_msg']}"
         for t in turns
     ])
-    hint = (
-        f"\nContext hints — tone: {episodic_decision.get('emotional_tone','')}, "
-        f"entities: {episodic_decision.get('key_entities', [])}"
+
+    # Pre-computed router values — passed as ground truth to the LLM
+    tone      = episodic_decision.get("emotional_tone", "neutral")
+    entities  = episodic_decision.get("key_entities", [])
+    cluster   = episodic_decision.get("topic_cluster", "general")
+    intensity = episodic_decision.get("emotional_intensity", 2)
+    importance = episodic_decision.get("importance_score", 5.0)
+
+    context = (
+        f"\nPre-computed metadata (do not re-derive):"
+        f"\n  tone: {tone}"
+        f"\n  entities: {entities}"
+        f"\n  cluster: {cluster}"
     )
+
     response = await client.chat.completions.create(
-        model=settings.claude_model,
-        max_tokens=350,
+        model=settings.extractor_model,
+        max_tokens=200,   # reduced — LLM only writes title, content, outcome now
         messages=[
             {"role": "system", "content": EPISODIC_SYSTEM},
-            {"role": "user", "content": f"Create episodic memory:\n{text}{hint}"}
+            {"role": "user",   "content": f"Create episodic memory:\n{text}{context}"}
         ]
     )
     result = _parse_json(response.choices[0].message.content)
     return {
-        "title":              result.get("title", "Conversation episode"),
-        "content":            result.get("content", text[:400]),
-        "outcome":            result.get("outcome", "unclear"),
-        "importance_score":   float(result.get("importance_score", 5.0)),
-        "emotional_intensity": int(result.get("emotional_intensity", 2)),
-        "topic_cluster":      result.get("topic_cluster", "general"),
+        # LLM-generated fields
+        "title":               result.get("title", "Conversation episode"),
+        "content":             result.get("content", text[:400]),
+        "outcome":             result.get("outcome", "unclear"),
+        # Router-provided fields — passed through directly, not re-derived
+        "importance_score":    float(importance),
+        "emotional_intensity": int(intensity),
+        "emotional_tone":      tone,
+        "topic_cluster":       cluster,
+        "key_entities":        entities,
     }

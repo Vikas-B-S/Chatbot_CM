@@ -916,6 +916,12 @@ let turnCount = 0;
 let allSessions = [];
 let allMemories = { fact:[], preference:[], goal:[], constraint:[] };
 
+// ── PATCH 3: Track seen memory keys for animation ──────────
+// Memories already rendered won't get the .new animation.
+// New memories (not yet seen this session) get .new → memPop.
+// Reset on session switch and logout.
+const seenMemoryKeys = new Set();
+
 // ── Tab switching ──────────────────────────────────────────
 function switchTab(tab) {
   document.querySelectorAll('.auth-tab').forEach((t,i) => t.classList.toggle('active', (i===0&&tab==='signin')||(i===1&&tab==='signup')));
@@ -1059,6 +1065,7 @@ function initApp(user, session) {
   updateSessionPill();
   loadMemories();
   loadEpisodic();
+  if (turnCount > 0) loadSessionHistory(sessionId);
 }
 
 // ── Logout ─────────────────────────────────────────────────
@@ -1066,6 +1073,7 @@ function doLogout() {
   userId = null; sessionId = null; username = ''; userEmail = '';
   turnCount = 0; allSessions = [];
   allMemories = { fact:[], preference:[], goal:[], constraint:[] };
+  seenMemoryKeys.clear(); // PATCH 3: reset animation tracker on logout
 
   document.getElementById('messages').innerHTML = `
     <div class="welcome" id="welcome">
@@ -1135,10 +1143,11 @@ function switchToSession(sess) {
   if (sess.session_id === sessionId) { closeSessionDropdown(); return; }
   sessionId = sess.session_id;
   turnCount = sess.total_turns || 0;
+  seenMemoryKeys.clear(); // PATCH 3: reset animation tracker on session switch
 
   document.getElementById('messages').innerHTML = `
     <div style="text-align:center;padding:32px;font-family:var(--font-mono);font-size:11px;color:var(--text3)">
-      // switched to ${sess.name || 'session'} · ${sess.total_turns || 0} turns
+      // loading ${sess.name || 'session'}…
     </div>`;
 
   updateSessionPill();
@@ -1146,11 +1155,13 @@ function switchToSession(sess) {
   showToast(`switched to ${sess.name || 'session'}`);
   loadMemories();
   loadEpisodic();
+  loadSessionHistory(sess.session_id);
 }
 
 async function newSession(e) {
   if (e) e.stopPropagation();
   closeSessionDropdown(); closeUserDropdown();
+  seenMemoryKeys.clear(); // PATCH 3: reset animation tracker on new session
 
   try {
     const res = await fetch(`${API}/sessions`, {
@@ -1175,6 +1186,8 @@ async function newSession(e) {
       </div>`;
 
     updateSessionPill();
+    loadMemories();
+    loadEpisodic();
     showToast('new session started');
   } catch(e) {
     showToast('failed to create session');
@@ -1208,6 +1221,39 @@ document.addEventListener('click', (e) => {
   if (!e.target.closest('#user-menu'))     closeUserDropdown();
 });
 
+// ── PATCH 1: Exponential backoff polling ───────────────────
+// Replaces the old fixed setInterval(2000) × 3 approach.
+// New schedule: 1s → 2s → 4s (total 7s window).
+// First attempt fires sooner (1s vs 2s before).
+// Stops early if turn data confirmed, otherwise runs all 3.
+function pollMemoriesWithBackoff(msgId) {
+  const delays = [1000, 2000, 4000];
+  let attempt = 0;
+
+  function scheduleNext() {
+    if (attempt >= delays.length) return;
+    const delay = delays[attempt];
+    attempt++;
+
+    setTimeout(async () => {
+      try {
+        loadMemories();
+        loadEpisodic();
+        if (msgId) {
+          const turnData = await loadLastTurnRouting(msgId);
+          // Stop polling early if we confirmed the turn was stored
+          if (turnData && turnData.turn_number) return;
+        }
+      } catch (err) {
+        console.warn('Memory poll attempt', attempt, 'failed:', err);
+      }
+      scheduleNext();
+    }, delay);
+  }
+
+  scheduleNext();
+}
+
 // ── Chat ───────────────────────────────────────────────────
 const input = document.getElementById('msg-input');
 
@@ -1231,6 +1277,10 @@ async function sendMessage() {
   addMessage('user', text, turnCount + 1);
   const typingId = addTyping();
 
+  // Declare msgId and fullText in outer scope so catch block can access them
+  let msgId   = null;
+  let fullText = '';
+
   try {
     const res = await fetch(`${API}/chat`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1244,13 +1294,12 @@ async function sendMessage() {
 
     removeTyping(typingId);
 
-    const msgId   = `msg-${Date.now()}`;
+    msgId = `msg-${Date.now()}`;
     addStreamingMessage(msgId);
 
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
     let   buffer  = '';
-    let   fullText = '';
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1276,21 +1325,8 @@ async function sendMessage() {
             const sess = allSessions.find(s => s.session_id === sessionId);
             if (sess) sess.total_turns = turnCount;
 
-            // ── FIX: Poll multiple times to catch background storage ──
-            // Poll for background storage results.
-            // Stops as soon as turn_number is found (storage complete)
-            // or after 3 attempts (6s) — whichever comes first.
-            const capturedMsgId = msgId;
-            let pollAttempts = 0;
-            const pollInterval = setInterval(async () => {
-              pollAttempts++;
-              loadMemories();
-              loadEpisodic();
-              const turnData = await loadLastTurnRouting(capturedMsgId);
-              if ((turnData && turnData.turn_number) || pollAttempts >= 3) {
-                clearInterval(pollInterval);
-              }
-            }, 2000); // polls every 2s, stops early when data found
+            // PATCH 1: exponential backoff (1s, 2s, 4s) replaces fixed 2s × 3
+            pollMemoriesWithBackoff(msgId);
           }
 
           if (chunk.error) throw new Error(chunk.error);
@@ -1301,7 +1337,14 @@ async function sendMessage() {
 
   } catch(e) {
     removeTyping(typingId);
-    addMessage('assistant', `// error: ${e.message}`, turnCount);
+    // PATCH 2: clean up any in-progress streaming bubble so cursor doesn't stick
+    if (msgId) {
+      finaliseStreamingMessage(msgId, fullText || '// connection interrupted', turnCount);
+    } else {
+      addMessage('assistant', `// error: ${e.message}`, turnCount);
+    }
+    // Still poll — background storage may have completed before the error
+    pollMemoriesWithBackoff(null);
   } finally {
     document.getElementById('send-btn').disabled = false;
     input.focus();
@@ -1344,19 +1387,24 @@ function finaliseStreamingMessage(msgId, text, turn) {
 
 function buildBadges(data) {
   const badges = [];
-  if (data.routing?.triggered_user_memory && data.memories_stored?.length > 0)
-    badges.push({ cls: 'memory', text: `+${data.memories_stored.length} memory` });
-  if (data.routing?.triggered_episodic && data.episodic_stored)
-    badges.push({ cls: 'episodic', text: 'episodic stored' });
+  const r = data.routing || {};
+  const memTriggered = r.trigger_user_memory || r.triggered_user_memory;
+  const epTriggered  = r.trigger_episodic    || r.triggered_episodic;
+  if (memTriggered && data.memories_stored?.length > 0)
+    badges.push({ cls: 'memory', text: `+${data.memories_stored.length} mem` });
+  if (epTriggered && data.episodic_stored)
+    badges.push({ cls: 'episodic', text: 'episodic' });
   if (data.summarization)
-    badges.push({ cls: 'summary', text: `summarized T${data.summarization.batch_start}-T${data.summarization.batch_end}` });
+    badges.push({ cls: 'summary', text: `∑ T${data.summarization.batch_start}-T${data.summarization.batch_end}` });
   return badges;
 }
 
 function addMessage(role, text, turn, badges = []) {
   const container = document.getElementById('messages');
   const div = document.createElement('div');
+  const msgId = `msg-${role}-t${turn}-${Date.now()}`;
   div.className = `message ${role}`;
+  div.id = msgId;
 
   const meta = document.createElement('div');
   meta.className = 'msg-meta';
@@ -1389,6 +1437,7 @@ function addMessage(role, text, turn, badges = []) {
 
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
+  return msgId;
 }
 
 // Simple markdown renderer
@@ -1435,7 +1484,7 @@ function removeTyping(id) { document.getElementById(id)?.remove(); }
 // ── Memory panel ───────────────────────────────────────────
 async function loadMemories() {
   try {
-    const res = await fetch(`${API}/users/${userId}/memory`);
+    const res = await fetch(`${API}/users/${userId}/memory?session_id=${sessionId}`);
     if (!res.ok) return;
     const data = await res.json();
     allMemories = { fact:[], preference:[], goal:[], constraint:[] };
@@ -1448,6 +1497,9 @@ async function loadMemories() {
   } catch(e) {}
 }
 
+// PATCH 3: Memory animation — track which keys have been rendered before.
+// New keys get class="memory-item <type> new" → triggers memPop animation.
+// Already-seen keys render normally without animation.
 function renderMemories() {
   const scroll = document.getElementById('memory-scroll');
   const empty  = document.getElementById('mem-empty');
@@ -1474,10 +1526,14 @@ function renderMemories() {
     title.innerHTML = `${label} <span class="count">${items.length}</span>`;
     section.appendChild(title);
     items.forEach(content => {
-      const item = document.createElement('div');
-      item.className = `memory-item ${cls}`;
+      const memKey = `${key}:${content}`;
+      const isNew  = !seenMemoryKeys.has(memKey);
+      const item   = document.createElement('div');
+      // Apply .new class only for memories we haven't rendered before
+      item.className = `memory-item ${cls}${isNew ? ' new' : ''}`;
       item.textContent = content;
       section.appendChild(item);
+      seenMemoryKeys.add(memKey); // mark as seen after render
     });
     scroll.appendChild(section);
   });
@@ -1491,7 +1547,7 @@ function renderMemories() {
 // ── Episodic panel ─────────────────────────────────────────
 async function loadEpisodic() {
   try {
-    const res = await fetch(`${API}/users/${userId}/episodic?limit=10`);
+    const res = await fetch(`${API}/users/${userId}/episodic?limit=10&session_id=${sessionId}`);
     if (!res.ok) return;
     const episodes = await res.json();
     const scroll = document.getElementById('episodic-scroll');
@@ -1542,19 +1598,75 @@ async function loadLastTurnRouting(msgId) {
 }
 
 // ── Router log ─────────────────────────────────────────────
+async function loadSessionHistory(sessId) {
+  try {
+    const res = await fetch(`${API}/sessions/${sessId}/turns?limit=100`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const turns = data.turns || [];
+    if (turns.length === 0) return;
+
+    const container = document.getElementById('messages');
+    container.innerHTML = '';
+
+    turns.forEach(t => {
+      // User message
+      addMessage('user', t.user_msg, t.turn_number);
+      // Assistant message
+      const msgId = addMessage('assistant', t.assistant_msg, t.turn_number);
+      // Routing badges if router_decision exists
+      if (msgId && t.router_decision) {
+        const rd = t.router_decision;
+        const badges = [];
+        if (rd.trigger_user_memory || rd.triggered_user_memory) {
+          const mems = rd.user_memories || [];
+          if (mems.length > 0) badges.push({ cls: 'memory', text: `+${mems.length} mem` });
+        }
+        if (rd.trigger_episodic || rd.triggered_episodic)
+          badges.push({ cls: 'episodic', text: 'episodic' });
+        if (badges.length > 0) {
+          const msgDiv = document.getElementById(msgId);
+          if (msgDiv) {
+            const ri = document.createElement('div');
+            ri.className = 'routing-info';
+            badges.forEach(b => {
+              const badge = document.createElement('span');
+              badge.className = `r-badge ${b.cls}`;
+              badge.textContent = b.text;
+              ri.appendChild(badge);
+            });
+            msgDiv.appendChild(ri);
+          }
+        }
+      }
+    });
+
+    // Scroll to bottom
+    container.scrollTop = container.scrollHeight;
+  } catch(e) {
+    console.error('loadSessionHistory error:', e);
+  }
+}
+
 function logRouter(data) {
   const log = document.getElementById('router-log-entries');
   const entry = document.createElement('div');
   entry.className = 'rl-entry';
+  const r = data.routing || {};
   const actions = [];
-  if (data.routing?.triggered_user_memory) actions.push('mem');
-  if (data.routing?.triggered_episodic)    actions.push('ep');
-  if (data.routing?.triggered_user_db)     actions.push('db');
-  if (data.summarization)                  actions.push('sum');
-  if (actions.length === 0)                actions.push('pass');
-  entry.innerHTML = `<span class="rl-turn">T${data.turn_number}</span> → <span class="rl-action">${actions.join(', ')}</span>`;
+  // support both trigger_ and triggered_ field naming
+  if (r.trigger_user_memory   || r.triggered_user_memory)  actions.push('mem');
+  if (r.trigger_episodic      || r.triggered_episodic)     actions.push('ep');
+  if (r.trigger_user_db       || r.triggered_user_db)      actions.push('db');
+  if (data.summarization)                                   actions.push('sum');
+  const skipped = r.skipped === true;
+  if (actions.length === 0) actions.push(skipped ? 'skip' : 'pass');
+  const color = actions[0] === 'skip' ? 'var(--text3)'
+              : actions[0] === 'pass' ? 'var(--accent2)'
+              : 'var(--accent)';
+  entry.innerHTML = `<span class="rl-turn">T${data.turn_number}</span> → <span class="rl-action" style="color:${color}">${actions.join(' + ')}</span>`;
   log.insertBefore(entry, log.firstChild);
-  while (log.children.length > 6) log.removeChild(log.lastChild);
+  while (log.children.length > 8) log.removeChild(log.lastChild);
 }
 
 // ── Helpers ────────────────────────────────────────────────

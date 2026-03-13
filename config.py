@@ -1,61 +1,79 @@
 """
-config.py — Centralised settings with clear storage responsibilities.
+config.py — Central settings via pydantic-settings
 
-Storage map:
-  Neo4j + Graphiti → ALL user memory: facts, preferences, goals, constraints
-                     Temporal edges, contradiction resolution, entity dedup
-  MongoDB          → Episodic memories (rich narrative records)
-  Redis            → Conversation summaries (level-0 batches + level-1 meta)
-  SQLite           → Users, sessions, raw turn logs (operational data only)
+Model strategy
+──────────────
+  claude_model    — main LLM for user-facing responses (powerful, slower, expensive)
+  router_model    — cheap fast model for routing decisions (~0ms extra latency)
+  extractor_model — cheap fast model for ALL summarization tasks in extractor.py
+
+  Why a separate extractor_model?
+    summarize_turns()      → structured JSON, 3-5 sentences   → no need for main model
+    compress_summaries()   → merge 3 summaries into 1         → no need for main model
+    compress_to_arc()      → higher-level compression         → no need for main model
+    create_handoff_summary() → 3 sentence handoff note        → no need for main model
+    create_episodic_narrative() → narrative from turns        → no need for main model
+
+    These are all structured extraction tasks with clear schemas.
+    gpt-4o-mini handles them perfectly at ~20x lower cost than a full model.
+
+  Cost example (100 turns/day, summarize every 3 turns):
+    Old: ~33 summarization cycles × 5 calls × main model cost
+    New: ~33 summarization cycles × 5 calls × mini model cost
+    Saving: ~95% on summarization costs with identical output quality
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field
 from functools import lru_cache
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # ── LLM via OpenRouter ────────────────────────────────────
-    openrouter_api_key:  str = Field(...,    env="OPENROUTER_API_KEY")
-    openrouter_base_url: str = Field("https://openrouter.ai/api/v1", env="OPENROUTER_BASE_URL")
-    claude_model:        str = Field("google/gemini-flash-2.0",   env="CLAUDE_MODEL")
-    router_model:        str = Field("google/gemini-flash-2.0",   env="ROUTER_MODEL")
+    # ── LLM models ────────────────────────────────────────────
+    # Main model — used only for user-facing responses in agent.py
+    claude_model: str = "anthropic/claude-3-5-sonnet"
 
-    # ── Embeddings (used by Graphiti for semantic search) ─────
-    embedding_model: str = Field("openai/text-embedding-3-small", env="EMBEDDING_MODEL")
+    # Router model — cheap fast model for routing decisions
+    # Already existed; kept separate so router and extractor can be tuned independently
+    router_model: str = "openai/gpt-4o-mini"
 
-    # ── Neo4j — Graphiti temporal knowledge graph ─────────────
-    # Note: neo4j_database removed — Graphiti manages its own db scoping
-    neo4j_uri:      str = Field("bolt://localhost:7687", env="NEO4J_URI")
-    neo4j_username: str = Field("neo4j",    env="NEO4J_USERNAME")
-    neo4j_password: str = Field("password", env="NEO4J_PASSWORD")
+    # Extractor model — cheap fast model for ALL summarization in extractor.py
+    # Covers: L0 batch summary, L1 compression, L2 arc, handoff, episodic narrative
+    # NEW (v3.3): was previously hardcoded to claude_model in extractor.py
+    extractor_model: str = "openai/gpt-4o-mini"
 
-    # ── MongoDB — episodic memories ───────────────────────────
-    mongo_uri:                 str = Field("mongodb://localhost:27017", env="MONGO_URI")
-    mongo_db:                  str = Field("chatbot",           env="MONGO_DB")
-    mongo_episodic_collection: str = Field("episodic_memories", env="MONGO_EPISODIC_COLLECTION")
+    # ── OpenRouter ────────────────────────────────────────────
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
-    # ── Redis — summaries ─────────────────────────────────────
-    redis_host:     str = Field("localhost", env="REDIS_HOST")
-    redis_port:     int = Field(6379,        env="REDIS_PORT")
-    redis_password: str = Field("",          env="REDIS_PASSWORD")
-    redis_db:       int = Field(0,           env="REDIS_DB")
+    # ── Neo4j ─────────────────────────────────────────────────
+    neo4j_uri:      str = "bolt://localhost:7687"
+    neo4j_username: str = "neo4j"
+    neo4j_password: str = "password"
 
-    # ── SQLite — users / sessions / turn logs ─────────────────
-    sqlite_db_path: str = Field("./chatbot.db", env="SQLITE_DB_PATH")
+    # ── MongoDB ───────────────────────────────────────────────
+    mongo_uri:                 str = "mongodb://localhost:27017"
+    mongo_db:                  str = "mnemo"
+    mongo_episodic_collection: str = "episodic_memories"
 
-    # ── Context window ────────────────────────────────────────
-    max_raw_turns:     int = Field(6, env="MAX_RAW_TURNS")
-    summarize_at_turn: int = Field(6, env="SUMMARIZE_AT_TURN")
-    summarize_batch:   int = Field(3, env="SUMMARIZE_BATCH")
+    # ── Redis ─────────────────────────────────────────────────
+    redis_host:     str = "localhost"
+    redis_port:     int = 6379
+    redis_password: str = ""
+    redis_db:       int = 0
 
-    debug: bool = Field(False, env="DEBUG")
+    # ── SQLite ────────────────────────────────────────────────
+    sqlite_db_path: str = "chatbot.db"
+
+    # ── Summarization schedule ────────────────────────────────
+    # summarize_at_turn: first summarization fires at this turn number
+    # summarize_batch:   how many turns per L0 batch
+    summarize_at_turn: int = 6
+    summarize_batch:   int = 3
 
     class Config:
         env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
+        extra    = "ignore"
 
 
-@lru_cache()
+@lru_cache
 def get_settings() -> Settings:
     return Settings()

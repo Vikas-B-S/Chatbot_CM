@@ -1,22 +1,20 @@
 """
-memory/context_builder.py — Context assembly with single shared query embedding
+memory/context_builder.py — Context assembly with session-scoped retrieval
+
+Session-scoping behaviour
+──────────────────────────
+  Neo4j facts        → user-scoped  (universal, no session filter)
+  Neo4j prefs/goals/constraints → session-scoped (only from current session_id)
+  MongoDB episodic   → session-scoped (only episodes from current session_id)
+  Redis summaries    → session-scoped (already was, unchanged)
+  SQLite raw turns   → session-scoped (already was, unchanged)
 
 Key optimisations
 ─────────────────
   1. Embed once — query embedded ONE time upfront, vector passed to all stores.
-  2. Neo4j result cache — cached in Redis for 30s.
+  2. Neo4j result cache — cached in Redis for 30s (keyed by user+session).
   3. All 4 stores fetched in parallel via asyncio.gather.
   4. Blind-spot fix — raw turns come from get_turns_from_last_summary().
-
-Diagnostics
-───────────
-  Per-step timing is printed on every context build so you can see
-  exactly which store is slow. Look for lines like:
-    ⏱ [ctx] embed: 12ms
-    ⏱ [ctx] neo4j: 45ms   ← or 13000ms if Neo4j is the bottleneck
-    ⏱ [ctx] mongo: 8ms
-    ⏱ [ctx] redis: 6ms
-    ⏱ [ctx] sqlite: 3ms
 """
 import asyncio
 import json
@@ -45,10 +43,19 @@ def should_summarize(turn_number: int) -> tuple[bool, int, int]:
     return True, batch_start, batch_end
 
 
-async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
+async def _get_neo4j_cached(
+    user_id: str,
+    session_id: str,
+    query: str,
+    query_vec: list
+) -> list:
+    """
+    Fetch Neo4j memories with 30s Redis cache.
+    Cache key includes session_id — switching sessions gets fresh results.
+    """
     from db.redis_manager import get_redis
     r         = await get_redis()
-    cache_key = f"neo4j_cache:{user_id}"
+    cache_key = f"neo4j_cache:{user_id}:{session_id}"
 
     try:
         cached = await r.get(cache_key)
@@ -66,7 +73,12 @@ async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
     except Exception:
         pass
 
-    result = await neo4j.get_user_memories(user_id, query=query, query_vec=query_vec)
+    result = await neo4j.get_user_memories(
+        user_id,
+        session_id=session_id,
+        query=query,
+        query_vec=query_vec
+    )
 
     try:
         await r.set(cache_key, json.dumps(result), ex=_NEO4J_CACHE_TTL)
@@ -76,12 +88,12 @@ async def _get_neo4j_cached(user_id: str, query: str, query_vec: list) -> list:
     return result
 
 
-# ── Timed wrappers — each prints its own duration ─────────────────────────────
+# ── Timed wrappers ─────────────────────────────────────────────────────────────
 
-async def _timed_neo4j(user_id, query, query_vec):
+async def _timed_neo4j(user_id: str, session_id: str, query: str, query_vec: list):
     t = time.monotonic()
     try:
-        result = await _get_neo4j_cached(user_id, query, query_vec)
+        result = await _get_neo4j_cached(user_id, session_id, query, query_vec)
         print(f"  ⏱ [ctx] neo4j:  {(time.monotonic()-t)*1000:.0f}ms → {len(result)} memories")
         return result
     except Exception as e:
@@ -89,12 +101,15 @@ async def _timed_neo4j(user_id, query, query_vec):
         return []
 
 
-async def _timed_mongo(user_id, session_id, query, query_vec):
+async def _timed_mongo(user_id: str, session_id: str, query: str, query_vec: list):
     t = time.monotonic()
     try:
         result = await mongo.get_user_episodic_memories(
-            user_id, limit=5, session_id=session_id,
-            query=query or None, query_vec=query_vec
+            user_id,
+            limit=5,
+            session_id=session_id,
+            query=query or None,
+            query_vec=query_vec
         )
         print(f"  ⏱ [ctx] mongo:  {(time.monotonic()-t)*1000:.0f}ms → {len(result)} episodes")
         return result
@@ -103,7 +118,7 @@ async def _timed_mongo(user_id, session_id, query, query_vec):
         return []
 
 
-async def _timed_redis(session_id, user_id, query, query_vec):
+async def _timed_redis(session_id: str, user_id: str, query: str, query_vec: list):
     t = time.monotonic()
     try:
         result = await redis_mgr.get_latest_summaries_for_context(
@@ -117,7 +132,7 @@ async def _timed_redis(session_id, user_id, query, query_vec):
         return []
 
 
-async def _timed_sqlite(session_id):
+async def _timed_sqlite(session_id: str):
     t = time.monotonic()
     try:
         result = await sql.get_turns_from_last_summary(session_id)
@@ -137,12 +152,15 @@ async def build_context(
 ) -> dict:
     """
     Parallel fetch from all 4 stores with single shared query embedding.
-    Embed once, pass vector to all stores — no duplicate API calls.
-    Per-step timing printed to console so slow stores are immediately visible.
+
+    All stores are now correctly session-scoped:
+      Neo4j   → facts: user-wide | prefs/goals/constraints: this session only
+      MongoDB → episodes from this session only
+      Redis   → summaries from this session (unchanged)
+      SQLite  → raw turns from this session (unchanged)
     """
     t_total = time.monotonic()
 
-    # ── Embed query once ──────────────────────────────────────
     query_vec = None
     if user_message:
         t_emb = time.monotonic()
@@ -153,9 +171,8 @@ async def build_context(
             print(f"  ⏱ [ctx] embed:  FAILED: {e}")
             query_vec = None
 
-    # ── Parallel fetch — each store timed independently ───────
     memories, episodic, summaries, raw_turns = await asyncio.gather(
-        _timed_neo4j(user_id, user_message, query_vec),
+        _timed_neo4j(user_id, session_id, user_message, query_vec),
         _timed_mongo(user_id, session_id, user_message, query_vec),
         _timed_redis(session_id, user_id, user_message, query_vec),
         _timed_sqlite(session_id),
@@ -169,6 +186,8 @@ async def build_context(
         "summaries":         summaries,
         "raw_turns":         raw_turns,
         "query_vec":         query_vec,
+        "session_id":        session_id,
+        "user_id":           user_id,
     }
 
 
@@ -176,7 +195,6 @@ def format_context_for_prompt(context: dict) -> str:
     """Format all context into structured prompt section for LLM."""
     parts = []
 
-    # ── 1. Neo4j facts grouped by type ───────────────────────
     memories = context.get("memories", [])
     if memories:
         by_type: dict[str, list] = {}
@@ -186,9 +204,9 @@ def format_context_for_prompt(context: dict) -> str:
 
         for mtype, header in [
             ("fact",       "## About This User"),
-            ("preference", "## User Preferences"),
-            ("goal",       "## User Goals"),
-            ("constraint", "## User Constraints"),
+            ("preference", "## User Preferences (this session)"),
+            ("goal",       "## User Goals (this session)"),
+            ("constraint", "## User Constraints (this session)"),
         ]:
             items = by_type.get(mtype, [])
             if items:
@@ -196,17 +214,15 @@ def format_context_for_prompt(context: dict) -> str:
                 for item in items:
                     parts.append(f"- {item}")
 
-    # ── 2. MongoDB episodic memories ──────────────────────────
     episodic = context.get("episodic_memories", [])
     if episodic:
-        parts.append("\n## Remembered Episodes")
+        parts.append("\n## Remembered Episodes (this session)")
         for ep in episodic[:2]:
             title   = ep.get("title", "Episode")
             outcome = ep.get("outcome", "")
             snippet = ep.get("content", "")[:220]
             parts.append(f"[{title} — {outcome}]: {snippet}…")
 
-    # ── 3. Redis summaries ────────────────────────────────────
     summaries = context.get("summaries", [])
     if summaries:
         for s in summaries:
@@ -224,7 +240,6 @@ def format_context_for_prompt(context: dict) -> str:
                 parts.append("\n## Recent Summary")
                 parts.append(f"[T{s['batch_start']}-T{s['batch_end']}]: {s['summary_text']}")
 
-    # ── 4. SQLite raw turns ───────────────────────────────────
     raw = context.get("raw_turns", [])
     if raw:
         parts.append(

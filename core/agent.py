@@ -20,6 +20,23 @@ KEY FIX (v3.2) — Why storage never ran before:
   The two functions share a `collected` dict that stream_tokens populates
   with the full response text and context while streaming. background_store_wrapper
   reads from it once streaming is done.
+
+CACHE INVALIDATION FIX (v3.3):
+────────────────────────────────
+  _invalidate_neo4j_cache() is replaced by neo4j.invalidate_neo4j_cache()
+  which now correctly accepts both user_id AND session_id.
+
+  Old call:  await _invalidate_neo4j_cache(user_id)
+             → deleted key: neo4j_cache:{user_id}          ← WRONG
+
+  New call:  await neo4j.invalidate_neo4j_cache(user_id, session_id)
+             → deleted key: neo4j_cache:{user_id}:{session_id}  ← CORRECT
+
+  The cache is written in context_builder.py as:
+    cache_key = f"neo4j_cache:{user_id}:{session_id}"
+
+  The old invalidation key never matched — stale Neo4j data was served
+  for up to 30 seconds after every memory write. Now it matches exactly.
 """
 import asyncio
 import time
@@ -310,7 +327,12 @@ async def _background_store(
                 source_turn=turn_number
             )
             result["memories_stored"] = mem_list
-            await _invalidate_neo4j_cache(user_id)
+
+            # ── FIX (v3.3): pass session_id so invalidation key matches
+            # what context_builder.py stored: neo4j_cache:{user_id}:{session_id}
+            # Old code deleted neo4j_cache:{user_id} — a key that never existed.
+            await neo4j.invalidate_neo4j_cache(user_id, session_id)
+
             print(f"  ✓ Neo4j: stored {len(mem_list)} memories")
         except Exception as e:
             print(f"  ✗ Neo4j FAILED: {e}")
@@ -360,12 +382,3 @@ async def _background_store(
         print(f"  · MongoDB: skipped (trigger={decision.trigger_episodic})")
 
     return result
-
-
-async def _invalidate_neo4j_cache(user_id: str):
-    try:
-        from db.redis_manager import get_redis
-        r = await get_redis()
-        await r.delete(f"neo4j_cache:{user_id}")
-    except Exception:
-        pass
