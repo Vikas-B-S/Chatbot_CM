@@ -26,17 +26,14 @@ CACHE INVALIDATION FIX (v3.3):
   _invalidate_neo4j_cache() is replaced by neo4j.invalidate_neo4j_cache()
   which now correctly accepts both user_id AND session_id.
 
-  Old call:  await _invalidate_neo4j_cache(user_id)
-             → deleted key: neo4j_cache:{user_id}          ← WRONG
+FORGET MECHANISM (v3.4):
+────────────────────────
+  touch_memories() is called in _background_store() for every response
+  that retrieved memories. This refreshes last_accessed_at and resets
+  confidence to 1.0 for actively used memories, preventing their decay.
 
-  New call:  await neo4j.invalidate_neo4j_cache(user_id, session_id)
-             → deleted key: neo4j_cache:{user_id}:{session_id}  ← CORRECT
-
-  The cache is written in context_builder.py as:
-    cache_key = f"neo4j_cache:{user_id}:{session_id}"
-
-  The old invalidation key never matched — stale Neo4j data was served
-  for up to 30 seconds after every memory write. Now it matches exactly.
+  Memories that are never retrieved do not get touched, so their confidence
+  decays over time (via decay_stale_memories called on session start).
 """
 import asyncio
 import time
@@ -94,6 +91,26 @@ async def stream_tokens(
     context     = await build_context(session_id, user_id, user_message)
     context_str = format_context_for_prompt(context)
     t_ctx = time.monotonic()
+
+    # ── Token budget check ────────────────────────────────────
+    # Estimate total prompt size before sending to LLM.
+    # context_str already logged its own size in format_context_for_prompt().
+    # Here we check the FULL prompt: system + user message.
+    from memory.context_builder import estimate_tokens
+    system_prompt  = AGENT_SYSTEM.format(context_section=context_str)
+    total_estimate = estimate_tokens(system_prompt) + estimate_tokens(user_message)
+    _MODEL_CTX_LIMIT = 8000   # conservative limit — safe for all OpenRouter models
+    _HARD_WARN       = _MODEL_CTX_LIMIT - 800  # leave 800 tokens for response
+
+    if total_estimate > _HARD_WARN:
+        print(f"  ⚠ [agent] PROMPT TOO LARGE: ~{total_estimate} tokens "
+              f"(limit={_HARD_WARN}, max_tokens=800). "
+              f"Response may be truncated or refused.")
+    else:
+        print(f"  · [agent] prompt size: ~{total_estimate} tokens "
+              f"(context={len(context_str)} chars, "
+              f"msg={len(user_message)} chars)")
+
     print(f"  ⏱ context_build: {(t_ctx-t0)*1000:.0f}ms  "
           f"[neo4j={len(context.get('memories',[]))} "
           f"mongo={len(context.get('episodic_memories',[]))} "
@@ -135,6 +152,8 @@ async def stream_tokens(
     print(f"  ⏱ stream_done:   {(t_end-t0)*1000:.0f}ms total  "
           f"({len(full_response)} chars)")
 
+    # Build retrieval summary for UI display
+    store_timings = context.get("store_timings", {})
     yield {
         "done": True,
         "context_used": {
@@ -142,6 +161,14 @@ async def stream_tokens(
             "episodic_count":  len(context.get("episodic_memories", [])),
             "summaries_count": len(context.get("summaries", [])),
             "raw_turns_count": len(context.get("raw_turns", [])),
+            "token_estimate":  total_estimate,
+            "stores": {
+                "neo4j":  store_timings.get("neo4j",  {"ms": 0, "count": 0, "hit": False}),
+                "mongo":  store_timings.get("mongo",  {"ms": 0, "count": 0, "hit": False}),
+                "redis":  store_timings.get("redis",  {"ms": 0, "count": 0, "hit": False}),
+                "sqlite": store_timings.get("sqlite", {"ms": 0, "count": 0, "hit": False}),
+                "total_ms": store_timings.get("total_ms", 0),
+            },
         }
     }
 
@@ -302,6 +329,22 @@ async def _background_store(
     except Exception as e:
         print(f"  ✗ SQLite save_turn FAILED: {e}")
 
+    # ── Step 3b: Touch retrieved memories (access tracking) ───
+    # This runs regardless of routing decision — it tracks which memories
+    # were actually used in building this response, preventing their decay.
+    retrieved_memories = context.get("memories", [])
+    if retrieved_memories:
+        canonical_keys = [
+            m.get("canonical_key")
+            for m in retrieved_memories
+            if m.get("canonical_key")
+        ]
+        if canonical_keys:
+            try:
+                await neo4j.touch_memories(user_id, canonical_keys)
+            except Exception as e:
+                print(f"  · touch_memories failed (non-fatal): {e}")
+
     if not isinstance(decision, RoutingDecision):
         return result
 
@@ -316,7 +359,9 @@ async def _background_store(
                     "content":       m.content,
                     "canonical_key": m.canonical_key,
                     "confidence":    m.confidence,
-                    "entities":      m.entities
+                    "entities":      m.entities,
+                    # Pass is_temporary from router if set, else let neo4j_manager infer
+                    "is_temporary":  getattr(m, "is_temporary", False),
                 }
                 for m in decision.user_memories
             ]
@@ -328,9 +373,7 @@ async def _background_store(
             )
             result["memories_stored"] = mem_list
 
-            # ── FIX (v3.3): pass session_id so invalidation key matches
-            # what context_builder.py stored: neo4j_cache:{user_id}:{session_id}
-            # Old code deleted neo4j_cache:{user_id} — a key that never existed.
+            # Invalidate cache so next context fetch gets fresh memories
             await neo4j.invalidate_neo4j_cache(user_id, session_id)
 
             print(f"  ✓ Neo4j: stored {len(mem_list)} memories")

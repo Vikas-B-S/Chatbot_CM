@@ -17,32 +17,44 @@ Two parallel systems work together:
 
 Session-scoping rules
 ─────────────────────
-  fact        → USER-scoped (universal across all sessions)
-                Always returned regardless of which session is active.
-                Examples: name, age, occupation, location
-
-  preference  → SESSION-scoped (only from current session)
-  goal        → SESSION-scoped (only from current session)
-  constraint  → SESSION-scoped (only from current session)
-                Returned only if their session_id matches the active session.
-                If a user re-states a preference in a new session, the node's
-                session_id is updated to the new session so it stays visible.
+  All memory types (fact, preference, goal, constraint) are USER-SCOPED.
+  They persist across sessions. Forgetting is handled by the confidence
+  decay mechanism, not by session boundaries.
 
 MemoryRecord node schema
 ────────────────────────
   (:MemoryRecord {
-    user_id:          string   — scopes to one user
-    session_id:       string   — session that last activated this record
-    canonical_key:    string   — stable snake_case identifier e.g. "coding_language"
-    memory_type:      string   — fact | preference | goal | constraint
-    content:          string   — the actual memory text
-    content_hash:     string   — MD5 of normalised content (dedup key)
-    status:           string   — "active" | "inactive"
-    version:          int      — increments on every state change for this key
-    created_at:       datetime — when this record was first created
-    activated_at:     datetime — when it last became active
-    deactivated_at:   datetime — when it was last deactivated (null if active)
+    user_id:           string   — scopes to one user
+    session_id:        string   — session that last activated this record
+    canonical_key:     string   — stable snake_case identifier e.g. "coding_language"
+    memory_type:       string   — fact | preference | goal | constraint
+    content:           string   — the actual memory text
+    content_hash:      string   — MD5 of normalised content (dedup key)
+    status:            string   — "active" | "inactive"
+    version:           int      — increments on every state change for this key
+    confidence:        float    — 0.0-1.0, decays when not accessed (default 1.0)
+    last_accessed_at:  datetime — updated every time this memory is retrieved
+    access_count:      int      — total retrieval count (never decremented)
+    is_temporary:      bool     — True for short-horizon goals (expire in 3d not 30d)
+    created_at:        datetime — when this record was first created
+    activated_at:      datetime — when it last became active
+    deactivated_at:    datetime — when it was last deactivated (null if active)
   })
+
+Forget mechanism (confidence decay)
+────────────────────────────────────
+  Memories that are never retrieved lose confidence over time:
+    Day 0:   confidence = 1.0  (just created)
+    Day 30:  confidence = 0.70 (unused for 30 days)
+    Day 60:  confidence = 0.49
+    Day 90:  confidence = 0.34 (filtered from context at < 0.4)
+    Day 120: confidence = 0.24 (pruned from DB at < 0.25)
+
+  Temporary memories (is_temporary=True) decay on a 3-day cycle instead.
+
+  Decay is triggered:
+    - On session creation (passive maintenance, no latency hit)
+    - Via POST /users/{user_id}/memory/maintenance (manual)
 
 State transition rules
 ──────────────────────
@@ -54,21 +66,16 @@ State transition rules
 
   EXACT DUPLICATE — same content_hash, currently inactive:
     REACTIVATE  deactivate current active for this key, reactivate this node
-                version += 1, session_id = current
+                version += 1, session_id = current, confidence reset to 1.0
 
   NEW VALUE — different content_hash, key exists:
     TRANSITION  deactivate all active for this key
-                CREATE new MemoryRecord(status=active, version=prev+1, session_id=current)
+                CREATE new MemoryRecord(status=active, version=prev+1)
 
 Cache invalidation fix (v3.3)
 ─────────────────────────────
-  FIX: _invalidate_neo4j_cache() now accepts session_id and deletes the
-  correct key: neo4j_cache:{user_id}:{session_id}
-
-  Previously, the invalidation key was neo4j_cache:{user_id} but the
-  cache was stored under neo4j_cache:{user_id}:{session_id} — so
-  invalidation never actually deleted anything, causing stale data
-  to be served for up to 30 seconds after a memory write.
+  invalidate_neo4j_cache() accepts session_id and deletes the correct key:
+  neo4j_cache:{user_id}:{session_id}
 """
 
 from __future__ import annotations
@@ -90,8 +97,20 @@ settings = get_settings()
 _graphiti: Optional[Graphiti] = None
 _username_cache: dict[str, str] = {}
 
-# Memory types that are session-scoped (not universal)
-_SESSION_SCOPED_TYPES = {"preference", "goal", "constraint"}
+# Confidence decay parameters
+_DECAY_INTERVAL_DAYS  = 30    # normal memories: decay every 30 days
+_DECAY_TEMP_DAYS      = 3     # temporary memories: decay every 3 days
+_DECAY_MULTIPLIER     = 0.7   # per interval: 1.0 → 0.70 → 0.49 → 0.34 → 0.24
+_CONFIDENCE_MIN_SHOW  = 0.4   # below this: filtered from context
+_CONFIDENCE_MIN_KEEP  = 0.25  # below this: pruned from DB
+
+# Semantic conflict detection threshold
+# If a new memory has cosine similarity >= this against any existing active memory
+# it is treated as a conflict regardless of canonical_key name.
+# This catches cases where the router uses different keys for the same concept
+# e.g. "employer" vs "workplace" vs "company" for the same job fact.
+# 0.85 = high enough to avoid false positives on related-but-different concepts.
+_CONFLICT_SIM_THRESHOLD = 0.85
 
 
 # ─── Graphiti lifecycle ───────────────────────────────────────────────────────
@@ -145,10 +164,15 @@ async def init_neo4j():
             "CREATE INDEX memory_record_type IF NOT EXISTS "
             "FOR (m:MemoryRecord) ON (m.user_id, m.memory_type, m.status)"
         )
-        # Index for session-scoped reads (preference/goal/constraint)
+        # Index for decay queries — scanning stale memories by access time
         await s.run(
-            "CREATE INDEX memory_record_session IF NOT EXISTS "
-            "FOR (m:MemoryRecord) ON (m.user_id, m.session_id, m.memory_type, m.status)"
+            "CREATE INDEX memory_record_accessed IF NOT EXISTS "
+            "FOR (m:MemoryRecord) ON (m.user_id, m.last_accessed_at)"
+        )
+        # Index for confidence filtering
+        await s.run(
+            "CREATE INDEX memory_record_confidence IF NOT EXISTS "
+            "FOR (m:MemoryRecord) ON (m.user_id, m.confidence, m.status)"
         )
     print("✓ Graphiti (Neo4j) ready")
 
@@ -268,6 +292,103 @@ async def store_memories_batch(
     return stored_ids
 
 
+async def _find_semantic_conflict(
+    driver,
+    user_id: str,
+    new_content: str,
+    new_ckey: str,
+    new_mtype: str,
+) -> dict | None:
+    """
+    Layer 2 conflict detection — catches inconsistent canonical_keys.
+
+    Two-pass approach:
+      Pass 1 — cosine similarity >= 0.85 (works well for full sentences)
+      Pass 2 — entity/keyword overlap (catches short content like "Microsoft"
+                vs "works at a startup in Bangalore" which embed differently
+                but clearly represent the same concept when one is a substring
+                of the other or shares a key entity)
+
+    Only runs when Layer 1 (same canonical_key) found nothing to deactivate.
+    """
+    try:
+        from db.embedder import _get_model, cosine_similarity
+        model = _get_model()
+
+        async with driver.session() as s:
+            res = await s.run(
+                "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:$mtype}) "
+                "WHERE m.canonical_key <> $ckey "
+                "RETURN m.canonical_key AS key, m.content AS content "
+                "LIMIT 50",
+                uid=user_id, mtype=new_mtype, ckey=new_ckey
+            )
+            records = await res.data()
+
+        if not records:
+            return None
+
+        new_vec      = model.encode(new_content[:256], normalize_embeddings=True).tolist()
+        new_lower    = new_content.lower()
+        # Extract meaningful words from new content (skip stop words)
+        _STOP = {"a","an","the","is","are","was","were","i","my","me","at","in",
+                 "to","for","of","and","or","on","with","this","that","it","its"}
+        new_words = {w for w in re.findall(r'\b\w+\b', new_lower) if w not in _STOP and len(w) > 2}
+
+        best_sim    = 0.0
+        best_record = None
+
+        for r in records:
+            existing_lower = r["content"].lower()
+            existing_vec   = model.encode(
+                r["content"][:256], normalize_embeddings=True
+            ).tolist()
+            sim = cosine_similarity(new_vec, existing_vec)
+
+            # Pass 1: cosine similarity threshold
+            if sim >= _CONFLICT_SIM_THRESHOLD:
+                if sim > best_sim:
+                    best_sim    = sim
+                    best_record = {**r, "sim": sim, "method": "cosine"}
+                continue
+
+            # Pass 2: entity/keyword overlap for short content
+            # Catches: new="works at a startup in Bangalore" existing="Microsoft"
+            # or new="moved to Bangalore" existing="lives in Hyderabad"
+            existing_words = {w for w in re.findall(r'\b\w+\b', existing_lower)
+                              if w not in _STOP and len(w) > 2}
+
+            # Check if old content appears as substring in new content
+            # e.g. "microsoft" in "leaving microsoft to join a startup"
+            old_in_new = r["content"].lower() in new_lower
+            # Check if new content shares significant words with old
+            overlap = new_words & existing_words
+            overlap_ratio = len(overlap) / max(len(new_words), 1)
+
+            # Short existing content (single word / short phrase) embedded in new content
+            # is a very strong conflict signal — e.g. old="Microsoft" new mentions Microsoft
+            if old_in_new and len(r["content"].split()) <= 4:
+                score = 0.80   # treat as high-confidence conflict
+                if score > best_sim:
+                    best_sim    = score
+                    best_record = {**r, "sim": score, "method": "substring"}
+            # Significant word overlap between same-type memories
+            elif overlap_ratio >= 0.5 and len(overlap) >= 2:
+                score = 0.70 + overlap_ratio * 0.15
+                if score > best_sim:
+                    best_sim    = score
+                    best_record = {**r, "sim": score, "method": "word_overlap"}
+
+        if best_sim >= 0.70 and best_record:
+            return best_record
+
+        return None
+
+    except Exception as e:
+        print(f"  ⚠ _find_semantic_conflict failed (non-fatal): {e}")
+        return None
+
+
 async def _process_one_memory(
     user_id: str,
     username: str,
@@ -278,15 +399,24 @@ async def _process_one_memory(
 ) -> str | None:
     """
     State machine for a single memory.
-    session_id is stored on every node and updated whenever a node is
-    activated within a new session (so session-scoped reads stay current).
+    All memory types are USER-SCOPED — session_id stored for provenance only.
+    confidence, last_accessed_at, access_count, is_temporary added for decay.
 
     Returns: episode_name (str) if written, None if skipped.
     """
-    mtype   = m["memory_type"]
-    content = m["content"]
-    ckey    = m.get("canonical_key", "unknown")
-    conf    = m.get("confidence", 1.0)
+    mtype        = m["memory_type"]
+    content      = m["content"]
+    ckey         = m.get("canonical_key", "unknown")
+    conf         = m.get("confidence", 1.0)
+    is_temporary = m.get("is_temporary", False)
+
+    # Detect temporary goals from content
+    # Router can set is_temporary=True, or we infer from keywords
+    if not is_temporary and mtype == "goal":
+        temp_signals = ["today", "this week", "by friday", "tonight", "this morning",
+                        "by tomorrow", "this sprint", "this deadline"]
+        if any(sig in content.lower() for sig in temp_signals):
+            is_temporary = True
 
     if conf < 0.5:
         return None
@@ -306,17 +436,18 @@ async def _process_one_memory(
         )
         existing_row = await res.single()
         if existing_row:
-            # Already active — but update session_id so this session can see it
+            # Already active — update session_id and reset confidence to 1.0
+            await s.run(
+                "MATCH (m:MemoryRecord {user_id:$uid, content_hash:$h, status:'active'}) "
+                "SET m.session_id = $sid, m.activated_at = $now, "
+                "    m.confidence = 1.0, m.last_accessed_at = $now",
+                uid=user_id, h=chash, sid=session_id, now=now.isoformat()
+            )
             if existing_row["sid"] != session_id:
-                await s.run(
-                    "MATCH (m:MemoryRecord {user_id:$uid, content_hash:$h, status:'active'}) "
-                    "SET m.session_id = $sid, m.activated_at = $now",
-                    uid=user_id, h=chash, sid=session_id, now=now.isoformat()
-                )
-                print(f"  ↳ CLAIM [{ckey}]: re-stated in new session, session_id updated")
+                print(f"  ↳ CLAIM [{ckey}]: re-stated in new session, confidence reset")
             else:
-                print(f"  ↳ SKIP [{ckey}]: identical content already active this session")
-            return None  # No new Graphiti episode needed for a pure claim/skip
+                print(f"  ↳ REFRESH [{ckey}]: re-stated, confidence reset to 1.0")
+            return None
 
         # ── State 2: same content exists but inactive → REACTIVATE ──
         res = await s.run(
@@ -329,16 +460,21 @@ async def _process_one_memory(
             await s.run(
                 """
                 MATCH (m:MemoryRecord {user_id:$uid, content_hash:$h})
-                SET m.status         = 'active',
-                    m.session_id     = $sid,
-                    m.activated_at   = $now,
-                    m.deactivated_at = null,
-                    m.version        = m.version + 1
+                SET m.status           = 'active',
+                    m.session_id       = $sid,
+                    m.activated_at     = $now,
+                    m.deactivated_at   = null,
+                    m.version          = m.version + 1,
+                    m.confidence       = 1.0,
+                    m.last_accessed_at = $now,
+                    m.access_count     = 0,
+                    m.is_temporary     = $is_temp
                 """,
-                uid=user_id, h=chash, sid=session_id, now=now.isoformat()
+                uid=user_id, h=chash, sid=session_id, now=now.isoformat(),
+                is_temp=is_temporary
             )
             action = "reactivated"
-            print(f"  ↳ REACTIVATE [{ckey}]: previously known value restored (session {session_id[:8]})")
+            print(f"  ↳ REACTIVATE [{ckey}]: previously known value restored, confidence=1.0")
 
         else:
             # ── State 3/4: new content → TRANSITION or CREATE ────
@@ -350,26 +486,48 @@ async def _process_one_memory(
             row   = await res.single()
             max_v = (row["v"] or 0) if row else 0
 
+            # Layer 1: deactivate same canonical_key (already existing logic)
             deactivated = await _deactivate_key(s, user_id, ckey, now)
+
+            # Layer 2: semantic conflict detection
+            # Only runs when Layer 1 found nothing to deactivate (deactivated == 0)
+            # meaning no existing record shares this canonical_key.
+            # Catches cross-key conflicts e.g. "employer" vs "workplace" for same job.
+            if deactivated == 0:
+                conflict = await _find_semantic_conflict(
+                    driver, user_id, content, ckey, mtype
+                )
+                if conflict:
+                    # Different key, same concept — deactivate the stale record
+                    await _deactivate_key(s, user_id, conflict["key"], now)
+                    deactivated = 1
+                    print(f"  ↳ CONFLICT-RESOLVED [{conflict['key']} → {ckey}] "
+                          f"sim={conflict['sim']:.2f}: "
+                          f"deactivated stale '{conflict['content'][:50]}'")
 
             await s.run(
                 """
                 CREATE (m:MemoryRecord {
-                    user_id:        $uid,
-                    session_id:     $sid,
-                    canonical_key:  $key,
-                    memory_type:    $mtype,
-                    content:        $content,
-                    content_hash:   $chash,
-                    status:         'active',
-                    version:        $ver,
-                    created_at:     $now,
-                    activated_at:   $now,
-                    deactivated_at: null
+                    user_id:           $uid,
+                    session_id:        $sid,
+                    canonical_key:     $key,
+                    memory_type:       $mtype,
+                    content:           $content,
+                    content_hash:      $chash,
+                    status:            'active',
+                    version:           $ver,
+                    confidence:        1.0,
+                    last_accessed_at:  $now,
+                    access_count:      0,
+                    is_temporary:      $is_temp,
+                    created_at:        $now,
+                    activated_at:      $now,
+                    deactivated_at:    null
                 })
                 """,
                 uid=user_id, sid=session_id, key=ckey, mtype=mtype,
-                content=content, chash=chash, ver=max_v + 1, now=now.isoformat()
+                content=content, chash=chash, ver=max_v + 1, now=now.isoformat(),
+                is_temp=is_temporary
             )
             action = "updated" if deactivated else "created"
             print(f"  ↳ {action.upper()} [{ckey}] v{max_v+1}: {content[:70]}")
@@ -385,7 +543,8 @@ async def _process_one_memory(
     ep_body = frames.get(mtype, "{}").format(content)
     ep_desc = (
         f"type:{mtype} | key:{ckey} | action:{action} | "
-        f"turn:{source_turn} | conf:{conf} | session:{session_id}"
+        f"turn:{source_turn} | conf:{conf} | session:{session_id} | "
+        f"temporary:{is_temporary}"
     )
     try:
         g = await _get_graphiti()
@@ -424,18 +583,22 @@ async def get_user_memories(
     query_vec: list = None,
 ) -> list[dict]:
     """
-    Returns ACTIVE memories with session-scoping:
-      - fact        → user-scoped (no session filter)
-      - preference  → session-scoped (session_id must match)
-      - goal        → session-scoped (session_id must match)
-      - constraint  → session-scoped (session_id must match)
-
-    When memory_type is None, returns facts (user-scoped) + session-scoped
-    prefs/goals/constraints for the given session_id.
+    Returns ACTIVE memories with confidence >= _CONFIDENCE_MIN_SHOW.
+    All types are now user-scoped — session_id is kept for provenance but
+    does NOT filter results.
 
     Ranked by local cosine similarity when query_vec provided.
+    Memories below _MIN_RELEVANCE are filtered out to reduce prompt noise —
+    e.g. "dark theme" preference is irrelevant to "Should I take the job?"
+    A minimum of _MIN_GUARANTEED_MEMORIES are always returned regardless
+    of score (name, employer, location should always be in context).
     """
-    records = await _get_memories_direct(user_id, session_id=session_id, memory_type=memory_type)
+    # Minimum relevance score to be included in context
+    _MIN_RELEVANCE           = 0.25
+    # Always keep at least this many top memories regardless of score
+    _MIN_GUARANTEED_MEMORIES = 4
+
+    records = await _get_memories_direct(user_id, memory_type=memory_type)
 
     if not records or not query_vec:
         return records
@@ -447,7 +610,17 @@ async def get_user_memories(
         scored.append((score, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [r for _, r in scored]
+
+    # Filter below threshold but always guarantee minimum memories
+    above_threshold = [(s, r) for s, r in scored if s >= _MIN_RELEVANCE]
+    if len(above_threshold) >= _MIN_GUARANTEED_MEMORIES:
+        result = [r for _, r in above_threshold]
+    else:
+        # Not enough above threshold — take top N guaranteed
+        result = [r for _, r in scored[:_MIN_GUARANTEED_MEMORIES]]
+
+    print(f"  · neo4j relevance filter: {len(scored)} total → {len(result)} above threshold")
+    return result
 
 
 def _local_relevance_score(content: str, query_vec: list) -> float:
@@ -462,97 +635,202 @@ def _local_relevance_score(content: str, query_vec: list) -> float:
 
 async def _get_memories_direct(
     user_id: str,
-    session_id: str = None,
     memory_type: str = None,
+    limit: int = 20,
 ) -> list[dict]:
     """
-    Direct Cypher read with session-scoping logic:
+    Direct Cypher read. All types are user-scoped.
+    Filters out memories with confidence < _CONFIDENCE_MIN_SHOW (half-decayed).
 
-      If memory_type == 'fact' (or no type specified and we want all):
-        → facts: no session filter (user-wide)
-        → prefs/goals/constraints: session filter applied if session_id given
-
-      If memory_type is a specific session-scoped type:
-        → apply session filter
+    LIMIT 20 (token budget fix):
+      Ordered by confidence DESC so the highest-quality memories are always
+      kept when a power user has more than 20 active records.
+      20 memories × ~15 tokens = ~300 tokens max — safe regardless of history length.
     """
     driver = await _get_driver()
 
-    # Case 1: specific type requested
-    if memory_type:
-        is_session_scoped = memory_type in _SESSION_SCOPED_TYPES
-        async with driver.session() as s:
-            if is_session_scoped and session_id:
-                res = await s.run(
-                    "MATCH (m:MemoryRecord {user_id:$uid, status:'active', "
-                    "memory_type:$mtype, session_id:$sid}) "
-                    "RETURN m ORDER BY m.activated_at DESC",
-                    uid=user_id, mtype=memory_type, sid=session_id
-                )
-            else:
-                res = await s.run(
-                    "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:$mtype}) "
-                    "RETURN m ORDER BY m.activated_at DESC",
-                    uid=user_id, mtype=memory_type
-                )
-            records = await res.data()
-        return [_row_to_dict(r["m"]) for r in records]
-
-    # Case 2: all types — split query
-    # facts are user-scoped; prefs/goals/constraints are session-scoped
     async with driver.session() as s:
-        # User-scoped facts (always returned)
-        res = await s.run(
-            "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:'fact'}) "
-            "RETURN m ORDER BY m.activated_at DESC",
-            uid=user_id
-        )
-        fact_records = await res.data()
-
-        # Session-scoped types
-        if session_id:
+        if memory_type:
             res = await s.run(
-                "MATCH (m:MemoryRecord {user_id:$uid, status:'active', session_id:$sid}) "
-                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
-                "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
-                uid=user_id, sid=session_id
+                "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:$mtype}) "
+                "WHERE m.confidence >= $min_conf "
+                "RETURN m ORDER BY m.confidence DESC, m.activated_at DESC "
+                "LIMIT $limit",
+                uid=user_id, mtype=memory_type,
+                min_conf=_CONFIDENCE_MIN_SHOW, limit=limit
             )
         else:
-            # No session_id — return all (for admin/debug views)
             res = await s.run(
                 "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) "
-                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
-                "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
-                uid=user_id
+                "WHERE m.confidence >= $min_conf "
+                "RETURN m ORDER BY m.confidence DESC, m.memory_type, m.activated_at DESC "
+                "LIMIT $limit",
+                uid=user_id, min_conf=_CONFIDENCE_MIN_SHOW, limit=limit
             )
-        scoped_records = await res.data()
+        records = await res.data()
 
-    all_records = fact_records + scoped_records
-    return [_row_to_dict(r["m"]) for r in all_records]
+    return [_row_to_dict(r["m"]) for r in records]
 
 
-def _row_to_dict(m: dict) -> dict:
+# ─── Forget mechanism — access tracking ───────────────────────────────────────
+
+async def touch_memories(user_id: str, canonical_keys: list[str]):
+    """
+    Called after every response that retrieved memories from Neo4j.
+    Updates last_accessed_at and increments access_count.
+    Resets confidence to 1.0 if memory was actively used.
+
+    This is the signal that prevents decay: a memory that keeps being
+    retrieved will never decay below 1.0.
+
+    Called from agent.py _background_store() — runs in background,
+    zero latency impact on the response.
+    """
+    if not canonical_keys:
+        return
+
+    driver = await _get_driver()
+    now    = _now().isoformat()
+
+    try:
+        async with driver.session() as s:
+            await s.run(
+                """
+                UNWIND $keys AS key
+                MATCH (m:MemoryRecord {user_id: $uid, canonical_key: key, status: 'active'})
+                SET m.last_accessed_at = $now,
+                    m.access_count     = coalesce(m.access_count, 0) + 1,
+                    m.confidence       = 1.0
+                """,
+                uid=user_id, keys=canonical_keys, now=now
+            )
+        print(f"  · touch_memories: refreshed {len(canonical_keys)} memories for {user_id[:8]}")
+    except Exception as e:
+        print(f"  ⚠ touch_memories failed (non-fatal): {e}")
+
+
+# ─── Forget mechanism — decay ─────────────────────────────────────────────────
+
+async def decay_stale_memories(user_id: str) -> dict:
+    """
+    Applies confidence decay to memories not accessed within their decay window.
+
+    Normal memories:    decay every 30 days if not accessed
+    Temporary memories: decay every 3 days if not accessed
+
+    Decay multiplier per interval: 0.7
+      After 1 interval: 1.0 → 0.70
+      After 2 intervals: 0.70 → 0.49
+      After 3 intervals: 0.49 → 0.34 (filtered from context)
+      After 4 intervals: 0.34 → 0.24 (pruned)
+
+    Safe to call on every session start — only touches stale records.
+    Returns counts of memories decayed.
+    """
+    driver   = await _get_driver()
+    now_iso  = _now().isoformat()
+
+    try:
+        async with driver.session() as s:
+            # Decay normal (non-temporary) stale memories
+            res = await s.run(
+                """
+                MATCH (m:MemoryRecord {user_id: $uid, status: 'active'})
+                WHERE (m.is_temporary = false OR m.is_temporary IS NULL)
+                  AND m.last_accessed_at < datetime($now) - duration({days: $interval})
+                  AND m.confidence > $min_keep
+                SET m.confidence = m.confidence * $multiplier
+                RETURN count(m) AS cnt
+                """,
+                uid=user_id,
+                now=now_iso,
+                interval=_DECAY_INTERVAL_DAYS,
+                multiplier=_DECAY_MULTIPLIER,
+                min_keep=_CONFIDENCE_MIN_KEEP
+            )
+            row    = await res.single()
+            normal = row["cnt"] if row else 0
+
+            # Decay temporary memories on shorter cycle
+            res = await s.run(
+                """
+                MATCH (m:MemoryRecord {user_id: $uid, status: 'active', is_temporary: true})
+                WHERE m.last_accessed_at < datetime($now) - duration({days: $interval})
+                  AND m.confidence > $min_keep
+                SET m.confidence = m.confidence * $multiplier
+                RETURN count(m) AS cnt
+                """,
+                uid=user_id,
+                now=now_iso,
+                interval=_DECAY_TEMP_DAYS,
+                multiplier=_DECAY_MULTIPLIER,
+                min_keep=_CONFIDENCE_MIN_KEEP
+            )
+            row  = await res.single()
+            temp = row["cnt"] if row else 0
+
+        total = normal + temp
+        if total > 0:
+            print(f"  · decay: {normal} normal + {temp} temporary memories decayed for {user_id[:8]}")
+        return {"decayed_normal": normal, "decayed_temporary": temp, "total_decayed": total}
+
+    except Exception as e:
+        print(f"  ⚠ decay_stale_memories failed (non-fatal): {e}")
+        return {"decayed_normal": 0, "decayed_temporary": 0, "total_decayed": 0, "error": str(e)}
+
+
+async def prune_dead_memories(user_id: str) -> dict:
+    """
+    Hard-deletes (deactivates) memories whose confidence has fallen below
+    _CONFIDENCE_MIN_KEEP. Called after decay_stale_memories.
+
+    We mark as 'inactive' rather than DELETE so the history is preserved
+    in case the user asks "what did you used to know about me?".
+    Actual node deletion only happens in delete_user_graph().
+
+    Returns count of pruned memories.
+    """
+    driver  = await _get_driver()
+    now_iso = _now().isoformat()
+
+    try:
+        async with driver.session() as s:
+            res = await s.run(
+                """
+                MATCH (m:MemoryRecord {user_id: $uid, status: 'active'})
+                WHERE m.confidence < $threshold
+                SET m.status         = 'inactive',
+                    m.deactivated_at = $now
+                RETURN count(m) AS cnt, collect(m.canonical_key) AS keys
+                """,
+                uid=user_id, threshold=_CONFIDENCE_MIN_KEEP, now=now_iso
+            )
+            row   = await res.single()
+            count = row["cnt"] if row else 0
+            keys  = row["keys"] if row else []
+
+        if count > 0:
+            print(f"  · prune: {count} dead memories deactivated for {user_id[:8]}: {keys[:5]}")
+        return {"pruned": count, "keys": keys}
+
+    except Exception as e:
+        print(f"  ⚠ prune_dead_memories failed (non-fatal): {e}")
+        return {"pruned": 0, "keys": [], "error": str(e)}
+
+
+async def run_memory_maintenance(user_id: str) -> dict:
+    """
+    Convenience wrapper: decay then prune in sequence.
+    Called on session start and via the /memory/maintenance endpoint.
+    Safe to call frequently — only touches stale/dead records.
+    """
+    decay_result = await decay_stale_memories(user_id)
+    prune_result = await prune_dead_memories(user_id)
     return {
-        "content":        m.get("content", ""),
-        "memory_type":    m.get("memory_type", "fact"),
-        "canonical_key":  m.get("canonical_key", ""),
-        "session_id":     m.get("session_id", ""),
-        "status":         m.get("status", "active"),
-        "version":        m.get("version", 1),
-        "activated_at":   m.get("activated_at"),
-        "deactivated_at": m.get("deactivated_at"),
-        "is_current":     m.get("status") == "active",
+        "user_id": user_id,
+        "decay":   decay_result,
+        "prune":   prune_result,
     }
-
-
-def _infer_type(fact: str) -> str:
-    f = fact.lower()
-    if any(w in f for w in ["prefer", "like", "love", "enjoy", "dislike", "hate"]):
-        return "preference"
-    if any(w in f for w in ["want", "goal", "achieve", "learn", "build"]):
-        return "goal"
-    if any(w in f for w in ["cannot", "must", "budget", "limit", "avoid", "constraint"]):
-        return "constraint"
-    return "fact"
 
 
 # ─── Timeline APIs ────────────────────────────────────────────────────────────
@@ -584,6 +862,8 @@ async def get_fact_history(user_id: str, topic: str) -> list[dict]:
         "session_id":      r["m"].get("session_id", ""),
         "status":          r["m"].get("status", "inactive"),
         "version":         r["m"].get("version", 1),
+        "confidence":      r["m"].get("confidence", 1.0),
+        "last_accessed_at": r["m"].get("last_accessed_at"),
         "activated_at":    r["m"].get("activated_at"),
         "deactivated_at":  r["m"].get("deactivated_at"),
         "is_reactivation": r["m"].get("version", 1) > 1 and r["m"].get("status") == "active",
@@ -605,12 +885,16 @@ async def get_memory_timeline(user_id: str, canonical_key: str) -> dict:
 
     versions = [
         {
-            "version":        r["m"]["version"],
-            "content":        r["m"]["content"],
-            "status":         r["m"]["status"],
-            "session_id":     r["m"].get("session_id", ""),
-            "activated_at":   r["m"]["activated_at"],
-            "deactivated_at": r["m"]["deactivated_at"],
+            "version":          r["m"]["version"],
+            "content":          r["m"]["content"],
+            "status":           r["m"]["status"],
+            "confidence":       r["m"].get("confidence", 1.0),
+            "access_count":     r["m"].get("access_count", 0),
+            "last_accessed_at": r["m"].get("last_accessed_at"),
+            "is_temporary":     r["m"].get("is_temporary", False),
+            "session_id":       r["m"].get("session_id", ""),
+            "activated_at":     r["m"]["activated_at"],
+            "deactivated_at":   r["m"]["deactivated_at"],
         }
         for r in records
     ]
@@ -622,6 +906,8 @@ async def get_memory_timeline(user_id: str, canonical_key: str) -> dict:
         "found":          True,
         "current_value":  active["content"] if active else None,
         "is_active":      active is not None,
+        "confidence":     active["confidence"] if active else 0.0,
+        "last_accessed_at": active["last_accessed_at"] if active else None,
         "total_versions": len(versions),
         "versions":       versions,
     }
@@ -631,38 +917,28 @@ async def get_memory_timeline(user_id: str, canonical_key: str) -> dict:
 
 async def get_full_memory_graph(user_id: str, session_id: str = None) -> dict:
     """
-    Full memory profile with session-scoping applied.
-    facts   = all active for user (universal)
-    others  = only from current session_id (if provided)
+    Full memory profile. All types are user-scoped.
+    Includes confidence scores for observability.
     """
     driver = await _get_driver()
     async with driver.session() as s:
-        # Facts — user-wide
         res = await s.run(
-            "MATCH (m:MemoryRecord {user_id:$uid, status:'active', memory_type:'fact'}) "
-            "RETURN m ORDER BY m.activated_at DESC",
-            uid=user_id
+            "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) "
+            "WHERE m.confidence >= $min_conf "
+            "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
+            uid=user_id, min_conf=_CONFIDENCE_MIN_SHOW
         )
-        fact_records = await res.data()
+        active_records = await res.data()
 
-        # Session-scoped types
-        if session_id:
-            res = await s.run(
-                "MATCH (m:MemoryRecord {user_id:$uid, status:'active', session_id:$sid}) "
-                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
-                "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
-                uid=user_id, sid=session_id
-            )
-        else:
-            res = await s.run(
-                "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) "
-                "WHERE m.memory_type IN ['preference', 'goal', 'constraint'] "
-                "RETURN m ORDER BY m.memory_type, m.activated_at DESC",
-                uid=user_id
-            )
-        scoped_records = await res.data()
+        # Low-confidence memories (visible but filtered from context)
+        res = await s.run(
+            "MATCH (m:MemoryRecord {user_id:$uid, status:'active'}) "
+            "WHERE m.confidence < $min_conf "
+            "RETURN m ORDER BY m.confidence ASC",
+            uid=user_id, min_conf=_CONFIDENCE_MIN_SHOW
+        )
+        fading_records = await res.data()
 
-        # Inactive counts (user-wide for history totals)
         res = await s.run(
             "MATCH (m:MemoryRecord {user_id:$uid, status:'inactive'}) "
             "RETURN m.memory_type AS mtype, count(m) AS cnt",
@@ -673,22 +949,21 @@ async def get_full_memory_graph(user_id: str, session_id: str = None) -> dict:
     inactive_counts = {r["mtype"]: r["cnt"] for r in inactive_raw}
     by_type: dict[str, list] = {"fact": [], "preference": [], "goal": [], "constraint": []}
 
-    for r in fact_records:
-        by_type["fact"].append(_row_to_dict(r["m"]))
-    for r in scoped_records:
+    for r in active_records:
         t = r["m"].get("memory_type", "fact")
         by_type.setdefault(t, []).append(_row_to_dict(r["m"]))
 
     return {
-        "user_id":          user_id,
-        "session_id":       session_id,
-        "memories_by_type": by_type,
-        "active_totals":    {t: len(v) for t, v in by_type.items()},
-        "inactive_totals":  inactive_counts,
-        "total_active":     sum(len(v) for v in by_type.values()),
-        "total_inactive":   sum(inactive_counts.values()),
-        "scope_note":       "facts=user-wide | preferences/goals/constraints=session-scoped",
-        "engine":           "Hybrid: Direct Cypher state machine + Graphiti semantic search",
+        "user_id":           user_id,
+        "memories_by_type":  by_type,
+        "fading_memories":   [_row_to_dict(r["m"]) for r in fading_records],
+        "active_totals":     {t: len(v) for t, v in by_type.items()},
+        "inactive_totals":   inactive_counts,
+        "total_active":      sum(len(v) for v in by_type.values()),
+        "total_fading":      len(fading_records),
+        "total_inactive":    sum(inactive_counts.values()),
+        "scope_note":        "all types are user-scoped | decay removes unused memories over time",
+        "engine":            "Hybrid: Direct Cypher state machine + Graphiti semantic search",
     }
 
 
@@ -711,18 +986,11 @@ async def delete_user_graph(user_id: str):
 
 
 # ─── Cache invalidation ───────────────────────────────────────────────────────
-# FIX (v3.3): now accepts session_id to build the correct cache key.
-# Previously used neo4j_cache:{user_id} but cache was stored under
-# neo4j_cache:{user_id}:{session_id} — so invalidation never matched
-# and stale data persisted for the full 30s TTL after every memory write.
 
 async def invalidate_neo4j_cache(user_id: str, session_id: str):
     """
     Delete the Neo4j cache entry for this user+session.
-
     Cache key format: neo4j_cache:{user_id}:{session_id}
-    This must exactly match the key written in context_builder.py:
-      cache_key = f"neo4j_cache:{user_id}:{session_id}"
     """
     try:
         from db.redis_manager import get_redis
@@ -734,3 +1002,34 @@ async def invalidate_neo4j_cache(user_id: str, session_id: str):
             print(f"  · Neo4j cache: no entry found to invalidate (already expired or never cached)")
     except Exception as e:
         print(f"  ⚠ Neo4j cache invalidation failed (non-fatal): {e}")
+
+
+# ─── Row serialisation ────────────────────────────────────────────────────────
+
+def _row_to_dict(m: dict) -> dict:
+    return {
+        "content":           m.get("content", ""),
+        "memory_type":       m.get("memory_type", "fact"),
+        "canonical_key":     m.get("canonical_key", ""),
+        "session_id":        m.get("session_id", ""),
+        "status":            m.get("status", "active"),
+        "version":           m.get("version", 1),
+        "confidence":        m.get("confidence", 1.0),
+        "last_accessed_at":  m.get("last_accessed_at"),
+        "access_count":      m.get("access_count", 0),
+        "is_temporary":      m.get("is_temporary", False),
+        "activated_at":      m.get("activated_at"),
+        "deactivated_at":    m.get("deactivated_at"),
+        "is_current":        m.get("status") == "active",
+    }
+
+
+def _infer_type(fact: str) -> str:
+    f = fact.lower()
+    if any(w in f for w in ["prefer", "like", "love", "enjoy", "dislike", "hate"]):
+        return "preference"
+    if any(w in f for w in ["want", "goal", "achieve", "learn", "build"]):
+        return "goal"
+    if any(w in f for w in ["cannot", "must", "budget", "limit", "avoid", "constraint"]):
+        return "constraint"
+    return "fact"

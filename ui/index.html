@@ -249,6 +249,55 @@ header {
 .sd-session:hover { background: var(--bg3); }
 .sd-session.active-sess { background: rgba(0,212,255,0.05); }
 
+/* Session action buttons shown on hover */
+.sd-session .ss-actions {
+  display: none; align-items: center; gap: 4px; flex-shrink: 0;
+}
+.sd-session:hover .ss-actions { display: flex; }
+
+.ss-act-btn {
+  background: none; border: none; cursor: pointer;
+  padding: 3px 5px; border-radius: 3px; font-size: 11px;
+  line-height: 1; transition: all 0.15s;
+}
+.ss-act-btn.rename { color: var(--text3); }
+.ss-act-btn.rename:hover { color: var(--accent); background: rgba(0,212,255,0.08); }
+.ss-act-btn.delete { color: var(--text3); }
+.ss-act-btn.delete:hover { color: var(--red); background: rgba(255,85,85,0.08); }
+
+/* Inline rename input */
+.ss-rename-input {
+  background: var(--bg); border: 1px solid var(--accent);
+  border-radius: 3px; color: var(--text); font-size: 12px;
+  font-family: var(--font-ui); font-weight: 600;
+  padding: 2px 6px; outline: none; width: 100%;
+}
+
+/* Delete confirm inline */
+.sd-session.confirming { background: rgba(255,85,85,0.05); }
+.ss-confirm-row {
+  display: none; align-items: center; gap: 6px;
+  padding: 6px 14px; background: rgba(255,85,85,0.06);
+  border-top: 1px solid rgba(255,85,85,0.15);
+}
+.sd-session.confirming + .ss-confirm-row { display: flex; }
+.ss-confirm-text {
+  font-family: var(--font-mono); font-size: 9px; color: var(--red);
+  flex: 1; letter-spacing: 0.04em;
+}
+.ss-confirm-yes {
+  background: var(--red); border: none; border-radius: 3px;
+  color: #fff; font-family: var(--font-mono); font-size: 9px;
+  padding: 3px 8px; cursor: pointer; letter-spacing: 0.04em;
+}
+.ss-confirm-yes:hover { opacity: 0.85; }
+.ss-confirm-no {
+  background: none; border: 1px solid var(--border2);
+  border-radius: 3px; color: var(--text3); font-family: var(--font-mono);
+  font-size: 9px; padding: 3px 8px; cursor: pointer;
+}
+.ss-confirm-no:hover { color: var(--text); }
+
 .sd-session .ss-dot {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--text3); flex-shrink: 0;
@@ -410,10 +459,48 @@ header {
   to   { opacity: 1; transform: translateX(0); }
 }
 
+/* Confidence bar under each memory item */
+.conf-bar {
+  height: 2px; border-radius: 1px; margin-top: 3px;
+  background: var(--border); overflow: hidden;
+}
+.conf-fill {
+  height: 100%; border-radius: 1px; transition: width 0.4s ease;
+}
+.conf-fill.high   { background: var(--green2); }
+.conf-fill.medium { background: var(--amber);  }
+.conf-fill.low    { background: var(--red);    }
+
+/* Fading memories section */
+.memory-section-title.fading {
+  color: var(--amber2); background: rgba(255,179,71,0.07);
+}
+.memory-item.fading {
+  border-left-color: var(--amber2); opacity: 0.55;
+}
+.memory-item.fading .conf-fill { background: var(--amber2); }
+
 .memory-empty {
   font-family: var(--font-mono); font-size: 10px; color: var(--text3);
   text-align: center; padding: 20px 10px; line-height: 1.8;
 }
+
+/* Maintenance button in sidebar header */
+.sidebar-header {
+  display: flex; flex-direction: column; gap: 4px;
+}
+.sidebar-header-row {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.btn-maintain {
+  background: none; border: 1px solid var(--border2);
+  border-radius: 4px; padding: 3px 8px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 9px; color: var(--text3);
+  letter-spacing: 0.06em; transition: all 0.2s; white-space: nowrap;
+}
+.btn-maintain:hover  { border-color: var(--amber); color: var(--amber); }
+.btn-maintain:active { opacity: 0.6; }
+.btn-maintain:disabled { opacity: 0.3; cursor: not-allowed; }
 
 .sidebar-footer {
   padding: 10px 14px; border-top: 1px solid var(--border); flex-shrink: 0;
@@ -634,6 +721,15 @@ header {
 .ep-outcome.ongoing  { color: var(--amber2); }
 .ep-outcome.unclear  { color: var(--text3);  }
 
+/* Forgotten episode count footer */
+.ep-footer {
+  padding: 8px 12px; border-top: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 9px; color: var(--text3);
+  flex-shrink: 0; display: flex; align-items: center; gap: 6px;
+  min-height: 30px;
+}
+.ep-forgotten-count { color: var(--amber2); }
+
 .rp-empty {
   font-family: var(--font-mono); font-size: 10px; color: var(--text3);
   text-align: center; padding: 20px 10px; line-height: 1.8;
@@ -654,6 +750,36 @@ header {
 .rl-entry:last-child { border-bottom: none; }
 .rl-entry .rl-turn   { color: var(--amber2); }
 .rl-entry .rl-action { color: var(--green2); }
+
+/* Retrieval log */
+.retrieval-log {
+  padding: 10px 12px; border-top: 1px solid var(--border); flex-shrink: 0;
+}
+.retrieval-log h4 {
+  font-family: var(--font-mono); font-size: 9px; color: var(--text3);
+  letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 7px;
+}
+.rl-ret-entry {
+  padding: 4px 0; border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 9px; line-height: 1.6;
+}
+.rl-ret-entry:last-child { border-bottom: none; }
+.rl-ret-turn  { color: var(--amber2); margin-right: 4px; }
+.rl-ret-total { color: var(--text3);  margin-left: 4px; font-size: 8px; }
+.rl-ret-stores { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.rl-store-pill {
+  padding: 1px 6px; border-radius: 10px; font-size: 8px; letter-spacing: 0.04em;
+}
+.rl-store-pill.hit  { opacity: 1; }
+.rl-store-pill.miss { opacity: 0.3; }
+.rl-store-pill.neo4j  { background: rgba(0,212,255,0.12);  color: var(--fact); }
+.rl-store-pill.mongo  { background: rgba(189,147,249,0.12); color: var(--pref); }
+.rl-store-pill.redis  { background: rgba(255,179,71,0.12);  color: var(--amber); }
+.rl-store-pill.sqlite { background: rgba(0,255,157,0.12);   color: var(--green); }
+.rl-token-badge {
+  font-size: 8px; color: var(--text3); padding: 1px 5px;
+  background: var(--bg3); border-radius: 10px; border: 1px solid var(--border);
+}
 
 /* ── Toast ───────────────────────────────────────────────── */
 #toast {
@@ -836,7 +962,10 @@ header {
   <!-- Left: Memory Graph -->
   <div class="sidebar">
     <div class="sidebar-header">
-      <h3>Memory Graph</h3>
+      <div class="sidebar-header-row">
+        <h3>Memory Graph</h3>
+        <button class="btn-maintain" id="btn-maintain" onclick="runMaintenance()" title="Decay + prune stale memories">↻ maintain</button>
+      </div>
       <p>// graphiti · neo4j · temporal</p>
     </div>
     <div class="memory-scroll" id="memory-scroll">
@@ -896,10 +1025,17 @@ header {
     <div class="rp-scroll" id="episodic-scroll">
       <div class="rp-empty" id="ep-empty">no episodes yet<br/>meaningful exchanges<br/>become memories</div>
     </div>
+    <div class="ep-footer" id="ep-footer"></div>
     <div class="router-log">
       <h4>// router log</h4>
       <div id="router-log-entries">
         <div class="rl-entry" style="color:var(--text3)">awaiting first turn…</div>
+      </div>
+    </div>
+    <div class="retrieval-log">
+      <h4>// retrieval log</h4>
+      <div id="retrieval-log-entries">
+        <div class="rl-ret-entry" style="color:var(--text3)">awaiting first turn…</div>
       </div>
     </div>
   </div>
@@ -915,12 +1051,82 @@ let userId = null, sessionId = null, username = '', userEmail = '';
 let turnCount = 0;
 let allSessions = [];
 let allMemories = { fact:[], preference:[], goal:[], constraint:[] };
+let lastLoggedTurn = 0;   // tracks highest router-logged turn — prevents stale/duplicate entries
 
 // ── PATCH 3: Track seen memory keys for animation ──────────
-// Memories already rendered won't get the .new animation.
-// New memories (not yet seen this session) get .new → memPop.
-// Reset on session switch and logout.
 const seenMemoryKeys = new Set();
+
+// ── Persist auth across reloads ────────────────────────────
+const _AUTH_KEY = 'synapse_auth';
+
+function saveAuth() {
+  try {
+    localStorage.setItem(_AUTH_KEY, JSON.stringify({
+      userId, sessionId, username, userEmail, apiUrl: API
+    }));
+  } catch(e) {}
+}
+
+function clearAuth() {
+  try { localStorage.removeItem(_AUTH_KEY); } catch(e) {}
+}
+
+// ── Auto-restore on page load ──────────────────────────────
+// Runs immediately — if valid saved auth exists, boots the app
+// directly and skips the login screen.
+(async function restoreSession() {
+  try {
+    const raw = localStorage.getItem(_AUTH_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (!s.userId || !s.sessionId) return;
+
+    // Restore API URL first so the validation fetch goes to the right server
+    API       = s.apiUrl   || API;
+    userId    = s.userId;
+    sessionId = s.sessionId;
+    username  = s.username  || '';
+    userEmail = s.userEmail || '';
+
+    document.getElementById('api-url-input').value = API;
+
+    // Validate the saved session still exists on the server
+    const res = await fetch(`${API}/sessions/${sessionId}`);
+    if (!res.ok) {
+      // Session gone (deleted or DB wiped) — clear storage and stay on login
+      clearAuth();
+      userId = sessionId = null; username = userEmail = '';
+      return;
+    }
+
+    const sess = await res.json();
+    turnCount = sess.total_turns || 0;
+
+    // Fetch sessions list so the dropdown is populated
+    const sessRes = await fetch(`${API}/users/${userId}/sessions`);
+    allSessions = sessRes.ok ? await sessRes.json() : [sess];
+    if (!allSessions.find(s => s.session_id === sessionId)) {
+      allSessions.unshift(sess);
+    }
+
+    // Boot the app — same as after a successful login
+    document.getElementById('auth-overlay').style.display = 'none';
+    document.getElementById('user-name-display').textContent = username;
+    document.getElementById('user-avatar-text').textContent  = username.charAt(0).toUpperCase();
+    document.getElementById('ud-name').textContent  = username;
+    document.getElementById('ud-email').textContent = userEmail;
+
+    updateSessionPill();
+    loadMemories();
+    loadEpisodic();
+    if (turnCount > 0) loadSessionHistory(sessionId);
+
+    showToast(`welcome back, ${username}`);
+  } catch(e) {
+    // Network error or parse failure — stay on login screen, don't crash
+    clearAuth();
+  }
+})();
 
 // ── Tab switching ──────────────────────────────────────────
 function switchTab(tab) {
@@ -1055,6 +1261,9 @@ function initApp(user, session) {
     allSessions.unshift(session);
   }
 
+  // Persist so reload restores the session without re-login
+  saveAuth();
+
   document.getElementById('auth-overlay').style.display = 'none';
 
   document.getElementById('user-name-display').textContent = username;
@@ -1070,8 +1279,9 @@ function initApp(user, session) {
 
 // ── Logout ─────────────────────────────────────────────────
 function doLogout() {
+  clearAuth();
   userId = null; sessionId = null; username = ''; userEmail = '';
-  turnCount = 0; allSessions = [];
+  turnCount = 0; allSessions = []; lastLoggedTurn = 0;
   allMemories = { fact:[], preference:[], goal:[], constraint:[] };
   seenMemoryKeys.clear(); // PATCH 3: reset animation tracker on logout
 
@@ -1094,7 +1304,8 @@ function doLogout() {
   document.getElementById('episodic-scroll').querySelectorAll('.episodic-card').forEach(e => e.remove());
   document.getElementById('ep-empty').style.display = 'block';
 
-  document.getElementById('router-log-entries').innerHTML = '<div class="rl-entry" style="color:var(--text3)">awaiting first turn…</div>';
+  document.getElementById('router-log-entries').innerHTML    = '<div class="rl-entry" style="color:var(--text3)">awaiting first turn…</div>';
+  document.getElementById('retrieval-log-entries').innerHTML = '<div class="rl-ret-entry" style="color:var(--text3)">awaiting first turn…</div>';
 
   document.getElementById('signin-email').value = '';
   document.getElementById('signin-password').value = '';
@@ -1123,27 +1334,146 @@ function updateSessionPill() {
 function renderSessionList() {
   const list = document.getElementById('sd-sessions-list');
   list.innerHTML = '';
+  const canDelete = allSessions.length > 1;
+
   allSessions.forEach(s => {
+    const isActive = s.session_id === sessionId;
+    const date = new Date(s.last_active || s.created_at)
+      .toLocaleDateString('en-US', { month:'short', day:'numeric' });
+
+    // Session row
     const div = document.createElement('div');
-    div.className = 'sd-session' + (s.session_id === sessionId ? ' active-sess' : '');
-    const date = new Date(s.last_active || s.created_at).toLocaleDateString('en-US', { month:'short', day:'numeric' });
+    div.className = 'sd-session' + (isActive ? ' active-sess' : '');
+    div.dataset.sid = s.session_id;
     div.innerHTML = `
       <div class="ss-dot"></div>
       <div class="ss-info">
-        <div class="ss-name">${s.name || 'Session'}</div>
+        <div class="ss-name" id="ssname-${s.session_id}">${s.name || 'Session'}</div>
         <div class="ss-meta">${date}</div>
       </div>
-      <div class="ss-turns">${s.total_turns || 0}T</div>`;
-    div.onclick = (e) => { e.stopPropagation(); switchToSession(s); };
+      <div class="ss-turns">${s.total_turns || 0}T</div>
+      <div class="ss-actions">
+        <button class="ss-act-btn rename" title="Rename"
+          onclick="startRename(event,'${s.session_id}')">✎</button>
+        ${canDelete && !isActive
+          ? `<button class="ss-act-btn delete" title="Delete"
+               onclick="confirmDelete(event,'${s.session_id}')">✕</button>`
+          : ''}
+      </div>`;
+    div.onclick = (e) => {
+      if (e.target.closest('.ss-actions') || e.target.closest('.ss-rename-input')) return;
+      e.stopPropagation();
+      switchToSession(s);
+    };
     list.appendChild(div);
+
+    // Confirm row (hidden until delete clicked)
+    const confirmDiv = document.createElement('div');
+    confirmDiv.className = 'ss-confirm-row';
+    confirmDiv.id = `confirm-${s.session_id}`;
+    confirmDiv.innerHTML = `
+      <span class="ss-confirm-text">delete "${s.name || 'Session'}"?</span>
+      <button class="ss-confirm-no"  onclick="cancelDelete(event,'${s.session_id}')">cancel</button>
+      <button class="ss-confirm-yes" onclick="doDeleteSession(event,'${s.session_id}')">delete</button>`;
+    list.appendChild(confirmDiv);
   });
+}
+
+function startRename(e, sid) {
+  e.stopPropagation();
+  const nameEl = document.getElementById(`ssname-${sid}`);
+  if (!nameEl) return;
+  const current = nameEl.textContent;
+  const input = document.createElement('input');
+  input.className = 'ss-rename-input';
+  input.value = current;
+  input.onclick = ev => ev.stopPropagation();
+  input.onkeydown = async (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); await commitRename(sid, input.value); }
+    if (ev.key === 'Escape') { nameEl.textContent = current; input.replaceWith(nameEl); }
+  };
+  input.onblur = async () => { await commitRename(sid, input.value); };
+  nameEl.replaceWith(input);
+  input.focus(); input.select();
+}
+
+async function commitRename(sid, newName) {
+  newName = (newName || '').trim();
+  if (!newName) newName = 'Untitled Session';
+  try {
+    const res = await fetch(`${API}/sessions/${sid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newName })
+    });
+    if (!res.ok) throw new Error();
+    // Update local state
+    const s = allSessions.find(s => s.session_id === sid);
+    if (s) s.name = newName;
+    if (sid === sessionId) {
+      document.getElementById('sp-name-display').textContent = newName;
+    }
+    renderSessionList();
+    showToast(`renamed to "${newName}"`);
+  } catch {
+    showToast('rename failed');
+    renderSessionList();
+  }
+}
+
+function confirmDelete(e, sid) {
+  e.stopPropagation();
+  // Clear any existing confirming state
+  document.querySelectorAll('.sd-session.confirming').forEach(el => {
+    el.classList.remove('confirming');
+  });
+  const row = document.querySelector(`.sd-session[data-sid="${sid}"]`);
+  if (row) row.classList.add('confirming');
+}
+
+function cancelDelete(e, sid) {
+  e.stopPropagation();
+  const row = document.querySelector(`.sd-session[data-sid="${sid}"]`);
+  if (row) row.classList.remove('confirming');
+}
+
+async function doDeleteSession(e, sid) {
+  e.stopPropagation();
+  if (allSessions.length <= 1) {
+    showToast('cannot delete the only session');
+    return;
+  }
+  try {
+    const res = await fetch(`${API}/sessions/${sid}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const data = await res.json();
+
+    // Remove from local state
+    allSessions = allSessions.filter(s => s.session_id !== sid);
+
+    const turns  = data.results?.sqlite?.turns_deleted || 0;
+    const eps    = data.results?.mongodb?.episodes_deleted || 0;
+    showToast(`session deleted (${turns} turns, ${eps} episodes removed)`);
+
+    renderSessionList();
+  } catch(err) {
+    showToast(`delete failed: ${err.message || 'server error'}`);
+    cancelDelete(e, sid);
+  }
 }
 
 function switchToSession(sess) {
   if (sess.session_id === sessionId) { closeSessionDropdown(); return; }
   sessionId = sess.session_id;
   turnCount = sess.total_turns || 0;
-  seenMemoryKeys.clear(); // PATCH 3: reset animation tracker on session switch
+  lastLoggedTurn = 0;
+  seenMemoryKeys.clear();
+
+  // Persist the new active session so reload restores it
+  saveAuth();
 
   document.getElementById('messages').innerHTML = `
     <div style="text-align:center;padding:32px;font-family:var(--font-mono);font-size:11px;color:var(--text3)">
@@ -1153,6 +1483,8 @@ function switchToSession(sess) {
   updateSessionPill();
   closeSessionDropdown();
   showToast(`switched to ${sess.name || 'session'}`);
+  document.getElementById('router-log-entries').innerHTML    = '<div class="rl-entry" style="color:var(--text3)">awaiting first turn…</div>';
+  document.getElementById('retrieval-log-entries').innerHTML = '<div class="rl-ret-entry" style="color:var(--text3)">awaiting first turn…</div>';
   loadMemories();
   loadEpisodic();
   loadSessionHistory(sess.session_id);
@@ -1161,7 +1493,8 @@ function switchToSession(sess) {
 async function newSession(e) {
   if (e) e.stopPropagation();
   closeSessionDropdown(); closeUserDropdown();
-  seenMemoryKeys.clear(); // PATCH 3: reset animation tracker on new session
+  lastLoggedTurn = 0;
+  seenMemoryKeys.clear();
 
   try {
     const res = await fetch(`${API}/sessions`, {
@@ -1172,6 +1505,9 @@ async function newSession(e) {
     allSessions.unshift(sess);
     sessionId = sess.session_id;
     turnCount = 0;
+
+    // Persist the new session
+    saveAuth();
 
     document.getElementById('messages').innerHTML = `
       <div class="welcome" id="welcome">
@@ -1222,18 +1558,17 @@ document.addEventListener('click', (e) => {
 });
 
 // ── PATCH 1: Exponential backoff polling ───────────────────
-// Replaces the old fixed setInterval(2000) × 3 approach.
-// New schedule: 1s → 2s → 4s (total 7s window).
-// First attempt fires sooner (1s vs 2s before).
-// Stops early if turn data confirmed, otherwise runs all 3.
-function pollMemoriesWithBackoff(msgId) {
-  const delays = [1000, 2000, 4000];
+// Poll schedule: 1.5s → 2.5s → 4s → 6s → 9s
+// First delay increased from 1s → 1.5s to reduce stale-data hits.
+// Background storage (router LLM + Neo4j write) typically takes 1-3s.
+// Exact match on expectedTurn prevents stale data from being logged.
+function pollMemoriesWithBackoff(msgId, expectedTurn) {
+  const delays = [1500, 2500, 4000, 6000, 9000];
   let attempt = 0;
 
   function scheduleNext() {
     if (attempt >= delays.length) return;
-    const delay = delays[attempt];
-    attempt++;
+    const delay = delays[attempt++];
 
     setTimeout(async () => {
       try {
@@ -1241,10 +1576,15 @@ function pollMemoriesWithBackoff(msgId) {
         loadEpisodic();
         if (msgId) {
           const turnData = await loadLastTurnRouting(msgId);
-          // Stop polling early if we confirmed the turn was stored
-          if (turnData && turnData.turn_number) return;
+          // Only log if this is exactly the turn we just sent
+          if (turnData?.turn_number && turnData.turn_number === expectedTurn) {
+            lastLoggedTurn = turnData.turn_number;
+            logRouter(turnData);
+            return;  // correct turn confirmed — stop polling
+          }
+          // turn_number doesn't match yet — storage still running, retry
         }
-      } catch (err) {
+      } catch(err) {
         console.warn('Memory poll attempt', attempt, 'failed:', err);
       }
       scheduleNext();
@@ -1325,8 +1665,13 @@ async function sendMessage() {
             const sess = allSessions.find(s => s.session_id === sessionId);
             if (sess) sess.total_turns = turnCount;
 
-            // PATCH 1: exponential backoff (1s, 2s, 4s) replaces fixed 2s × 3
-            pollMemoriesWithBackoff(msgId);
+            // Log retrieval path from context_used
+            if (chunk.context_used) {
+              logRetrieval(turnCount, chunk.context_used);
+            }
+
+            // Pass exact expected turn so poll ignores stale data
+            pollMemoriesWithBackoff(msgId, turnCount);
           }
 
           if (chunk.error) throw new Error(chunk.error);
@@ -1344,7 +1689,7 @@ async function sendMessage() {
       addMessage('assistant', `// error: ${e.message}`, turnCount);
     }
     // Still poll — background storage may have completed before the error
-    pollMemoriesWithBackoff(null);
+    pollMemoriesWithBackoff(null, null);
   } finally {
     document.getElementById('send-btn').disabled = false;
     input.focus();
@@ -1484,15 +1829,17 @@ function removeTyping(id) { document.getElementById(id)?.remove(); }
 // ── Memory panel ───────────────────────────────────────────
 async function loadMemories() {
   try {
-    const res = await fetch(`${API}/users/${userId}/memory?session_id=${sessionId}`);
+    const res = await fetch(`${API}/users/${userId}/memory`);
     if (!res.ok) return;
     const data = await res.json();
     allMemories = { fact:[], preference:[], goal:[], constraint:[] };
     const byType = data.memories_by_type || {};
     for (const [type, items] of Object.entries(byType)) {
       if (allMemories[type] !== undefined)
-        allMemories[type] = items.map(m => m.content || m.fact || '').filter(Boolean);
+        allMemories[type] = items;   // keep full objects now, not just content strings
     }
+    // fading_memories: confidence < 0.4, filtered from context but not yet pruned
+    allMemories._fading = data.fading_memories || [];
     renderMemories();
   } catch(e) {}
 }
@@ -1503,7 +1850,11 @@ async function loadMemories() {
 function renderMemories() {
   const scroll = document.getElementById('memory-scroll');
   const empty  = document.getElementById('mem-empty');
-  const total  = Object.values(allMemories).flat().length;
+  const active = Object.entries(allMemories)
+    .filter(([k]) => k !== '_fading')
+    .flatMap(([,v]) => v);
+  const fading = allMemories._fading || [];
+  const total  = active.length + fading.length;
 
   if (total === 0) { if (empty) empty.style.display = 'block'; return; }
   if (empty) empty.style.display = 'none';
@@ -1525,47 +1876,112 @@ function renderMemories() {
     title.className = `memory-section-title ${cls}`;
     title.innerHTML = `${label} <span class="count">${items.length}</span>`;
     section.appendChild(title);
-    items.forEach(content => {
+    items.forEach(m => {
+      const content = m.content || m.fact || '';
+      if (!content) return;
+      const conf   = typeof m.confidence === 'number' ? m.confidence : 1.0;
       const memKey = `${key}:${content}`;
       const isNew  = !seenMemoryKeys.has(memKey);
       const item   = document.createElement('div');
-      // Apply .new class only for memories we haven't rendered before
       item.className = `memory-item ${cls}${isNew ? ' new' : ''}`;
       item.textContent = content;
+
+      // Confidence bar
+      const barLevel = conf >= 0.75 ? 'high' : conf >= 0.5 ? 'medium' : 'low';
+      item.innerHTML += `<div class="conf-bar"><div class="conf-fill ${barLevel}" style="width:${Math.round(conf*100)}%"></div></div>`;
+
       section.appendChild(item);
-      seenMemoryKeys.add(memKey); // mark as seen after render
+      seenMemoryKeys.add(memKey);
     });
     scroll.appendChild(section);
   });
 
-  document.getElementById('stat-facts').textContent = allMemories.fact.length;
-  document.getElementById('stat-prefs').textContent = allMemories.preference.length;
-  document.getElementById('stat-goals').textContent = allMemories.goal.length;
-  document.getElementById('stat-cons').textContent  = allMemories.constraint.length;
+  // Fading section — memories below context threshold, about to be pruned
+  if (fading.length > 0) {
+    const section = document.createElement('div');
+    section.className = 'memory-section';
+    const title = document.createElement('div');
+    title.className = 'memory-section-title fading';
+    title.innerHTML = `Fading <span class="count">${fading.length}</span>`;
+    section.appendChild(title);
+    fading.forEach(m => {
+      const content = m.content || '';
+      if (!content) return;
+      const conf = typeof m.confidence === 'number' ? m.confidence : 0.3;
+      const item = document.createElement('div');
+      item.className = 'memory-item fading';
+      item.title = `confidence: ${(conf * 100).toFixed(0)}% — filtered from context`;
+      item.textContent = content;
+      item.innerHTML += `<div class="conf-bar"><div class="conf-fill" style="width:${Math.round(conf*100)}%;background:var(--amber2)"></div></div>`;
+      section.appendChild(item);
+    });
+    scroll.appendChild(section);
+  }
+
+  const counts = {
+    fact:       (allMemories.fact       || []).length,
+    preference: (allMemories.preference || []).length,
+    goal:       (allMemories.goal       || []).length,
+    constraint: (allMemories.constraint || []).length,
+  };
+  document.getElementById('stat-facts').textContent = counts.fact;
+  document.getElementById('stat-prefs').textContent = counts.preference;
+  document.getElementById('stat-goals').textContent = counts.goal;
+  document.getElementById('stat-cons').textContent  = counts.constraint;
 }
 
 // ── Episodic panel ─────────────────────────────────────────
 async function loadEpisodic() {
   try {
-    const res = await fetch(`${API}/users/${userId}/episodic?limit=10&session_id=${sessionId}`);
-    if (!res.ok) return;
-    const episodes = await res.json();
-    const scroll = document.getElementById('episodic-scroll');
-    const empty  = document.getElementById('ep-empty');
-    if (episodes.length === 0) { if (empty) empty.style.display = 'block'; return; }
-    if (empty) empty.style.display = 'none';
-    scroll.querySelectorAll('.episodic-card').forEach(el => el.remove());
-    episodes.forEach(ep => {
-      const card = document.createElement('div');
-      card.className = 'episodic-card';
-      card.innerHTML = `
-        <div class="ep-title">${ep.title || 'Episode'}</div>
-        <div class="ep-meta">
-          <span class="ep-tone">${ep.emotional_tone || 'neutral'}</span>
-          <span class="ep-outcome ${ep.outcome}">${ep.outcome || 'unclear'}</span>
-        </div>`;
-      scroll.insertBefore(card, scroll.firstChild);
-    });
+    const [epRes, statsRes] = await Promise.all([
+      fetch(`${API}/users/${userId}/episodic?limit=10&session_id=${sessionId}`),
+      fetch(`${API}/users/${userId}/episodic/stats`)
+    ]);
+
+    // Render episodes
+    if (epRes.ok) {
+      const episodes = await epRes.json();
+      const scroll = document.getElementById('episodic-scroll');
+      const empty  = document.getElementById('ep-empty');
+      if (episodes.length === 0) { if (empty) empty.style.display = 'block'; }
+      else {
+        if (empty) empty.style.display = 'none';
+        scroll.querySelectorAll('.episodic-card').forEach(el => el.remove());
+        episodes.forEach(ep => {
+          const card = document.createElement('div');
+          card.className = 'episodic-card';
+          card.innerHTML = `
+            <div class="ep-title">${ep.title || 'Episode'}</div>
+            <div class="ep-meta">
+              <span class="ep-tone">${ep.emotional_tone || 'neutral'}</span>
+              <span class="ep-outcome ${ep.outcome}">${ep.outcome || 'unclear'}</span>
+            </div>`;
+          scroll.insertBefore(card, scroll.firstChild);
+        });
+      }
+    }
+
+    // Render forgotten count footer
+    if (statsRes.ok) {
+      const stats   = await statsRes.json();
+      const footer  = document.getElementById('ep-footer');
+      const forgotten = stats.superseded_episodes || 0;
+      const reasons   = stats.supersede_reasons  || {};
+      if (footer) {
+        if (forgotten === 0) {
+          footer.innerHTML = '';
+        } else {
+          const parts = [];
+          if (reasons['stale:low_value'])         parts.push(`${reasons['stale:low_value']} low-value`);
+          if (reasons['stale:never_read'])         parts.push(`${reasons['stale:never_read']} never-read`);
+          if (reasons['stale:abandoned'])          parts.push(`${reasons['stale:abandoned']} abandoned`);
+          if (reasons['stale:resolved_forgotten']) parts.push(`${reasons['stale:resolved_forgotten']} resolved`);
+          if (reasons['consolidated'])             parts.push(`${reasons['consolidated']} consolidated`);
+          const detail = parts.length ? ` (${parts.join(', ')})` : '';
+          footer.innerHTML = `<span class="ep-forgotten-count">${forgotten} forgotten${detail}</span>`;
+        }
+      }
+    }
   } catch(e) {}
 }
 
@@ -1592,7 +2008,8 @@ async function loadLastTurnRouting(msgId) {
         msgDiv.appendChild(ri);
       }
     }
-    logRouter(data);
+    // logRouter intentionally removed — pollMemoriesWithBackoff
+    // now owns logging with deduplication via lastLoggedTurn
     return data;
   } catch(e) { return null; }
 }
@@ -1650,23 +2067,86 @@ async function loadSessionHistory(sessId) {
 
 function logRouter(data) {
   const log = document.getElementById('router-log-entries');
-  const entry = document.createElement('div');
-  entry.className = 'rl-entry';
   const r = data.routing || {};
   const actions = [];
-  // support both trigger_ and triggered_ field naming
-  if (r.trigger_user_memory   || r.triggered_user_memory)  actions.push('mem');
-  if (r.trigger_episodic      || r.triggered_episodic)     actions.push('ep');
-  if (r.trigger_user_db       || r.triggered_user_db)      actions.push('db');
-  if (data.summarization)                                   actions.push('sum');
+  if (r.trigger_user_memory || r.triggered_user_memory) actions.push('mem');
+  if (r.trigger_episodic    || r.triggered_episodic)    actions.push('ep');
+  if (data.summarization)                               actions.push('sum');
   const skipped = r.skipped === true;
   if (actions.length === 0) actions.push(skipped ? 'skip' : 'pass');
   const color = actions[0] === 'skip' ? 'var(--text3)'
               : actions[0] === 'pass' ? 'var(--accent2)'
               : 'var(--accent)';
-  entry.innerHTML = `<span class="rl-turn">T${data.turn_number}</span> → <span class="rl-action" style="color:${color}">${actions.join(' + ')}</span>`;
-  log.insertBefore(entry, log.firstChild);
-  while (log.children.length > 8) log.removeChild(log.lastChild);
+  log.innerHTML = `<div class="rl-entry"><span class="rl-turn">T${data.turn_number}</span> → <span class="rl-action" style="color:${color}">${actions.join(' + ')}</span></div>`;
+}
+
+function logRetrieval(turn, ctx) {
+  const log    = document.getElementById('retrieval-log-entries');
+  const stores = ctx.stores || {};
+  const tokens = ctx.token_estimate || 0;
+  const totalMs = stores.total_ms || 0;
+
+  const storeList = [
+    { key: 'neo4j',  label: 'neo4j',  count: stores.neo4j?.count  || 0, hit: stores.neo4j?.hit,  ms: stores.neo4j?.ms  || 0 },
+    { key: 'mongo',  label: 'mongo',  count: stores.mongo?.count  || 0, hit: stores.mongo?.hit,  ms: stores.mongo?.ms  || 0 },
+    { key: 'redis',  label: 'redis',  count: stores.redis?.count  || 0, hit: stores.redis?.hit,  ms: stores.redis?.ms  || 0 },
+    { key: 'sqlite', label: 'sqlite', count: stores.sqlite?.count || 0, hit: stores.sqlite?.hit, ms: stores.sqlite?.ms || 0 },
+  ];
+
+  const pillsHtml = storeList.map(s => {
+    const cls  = s.hit ? 'hit' : 'miss';
+    const body = s.hit ? `${s.label}:${s.count} <span style="opacity:0.5">${s.ms}ms</span>` : s.label;
+    return `<span class="rl-store-pill ${s.key} ${cls}">${body}</span>`;
+  }).join('');
+
+  const warn     = tokens > 2500 ? `<span style="color:var(--red)">⚠ ${tokens}t</span>` : '';
+  const tokBadge = tokens ? `<span class="rl-token-badge">${warn || '~' + tokens + 't'}</span>` : '';
+
+  log.innerHTML = `<div class="rl-ret-entry">
+    <span class="rl-ret-turn">T${turn}</span>
+    <span class="rl-ret-total">${totalMs}ms</span>
+    ${tokBadge}
+    <div class="rl-ret-stores">${pillsHtml}</div>
+  </div>`;
+}
+
+// ── Memory maintenance (forget mechanism) ──────────────────
+async function runMaintenance() {
+  const btn = document.getElementById('btn-maintain');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = '↻ running…';
+  try {
+    const res = await fetch(
+      `${API}/users/${userId}/memory/maintenance/sync`,
+      { method: 'POST' }
+    );
+    if (!res.ok) throw new Error(res.statusText);
+    const data = await res.json();
+
+    const decayed = data.neo4j?.decay?.total_decayed || 0;
+    const pruned  = data.neo4j?.prune?.pruned || 0;
+    const forgotten = data.mongodb?.forget?.total_superseded || 0;
+    const mPruned   = data.mongodb?.prune?.total_pruned || 0;
+
+    const parts = [];
+    if (decayed)   parts.push(`${decayed} decayed`);
+    if (pruned)    parts.push(`${pruned} pruned`);
+    if (forgotten) parts.push(`${forgotten} episodes forgotten`);
+    if (mPruned)   parts.push(`${mPruned} episodes deleted`);
+
+    const msg = parts.length ? parts.join(', ') : 'nothing to clean up';
+    showToast(`maintenance: ${msg}`);
+
+    // Reload panels to reflect changes
+    await loadMemories();
+    await loadEpisodic();
+  } catch(e) {
+    showToast('maintenance failed — check server');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↻ maintain';
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────

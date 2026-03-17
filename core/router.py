@@ -102,19 +102,11 @@ class EpisodicDecision:
 
 
 @dataclass
-class UserDbUpdate:
-    should_update: bool
-    fields:        dict = field(default_factory=dict)
-
-
-@dataclass
 class RoutingDecision:
     trigger_user_memory: bool
     trigger_episodic:    bool
-    trigger_user_db:     bool
-    user_memories:       list                      = field(default_factory=list)
+    user_memories:       list                       = field(default_factory=list)
     episodic:            Optional[EpisodicDecision] = None
-    user_db:             Optional[UserDbUpdate]     = None
     router_reasoning:    str                        = ""
     skipped:             bool                       = False
 
@@ -123,7 +115,6 @@ class RoutingDecision:
         return {
             "trigger_user_memory":      self.trigger_user_memory,
             "trigger_episodic":         self.trigger_episodic,
-            "trigger_user_db":          self.trigger_user_db,
             "user_memories_count":      len(self.user_memories),
             "episodic_should_store":    ep.should_store if ep else False,
             "episodic_importance":      ep.importance_score if ep else 0,
@@ -145,11 +136,27 @@ _STORE_SIGNALS = [
 ]
 
 _SKIP_SIGNALS = [
-    r"^(hi|hello|hey|thanks|thank you|ok|okay|got it|sure|yes|no|nope|yep|cool|great|awesome|nice|perfect|alright|fine|sounds good|makes sense|understood|correct|right|wrong)[\s!.?]*$",
-    r"^(what is|what are|what does|what do|how do|how does|how can|how to|can you|could you|please|explain|tell me|show me|give me|list|describe|define|compare|contrast)\b",
+    # Pure acknowledgements — exact match (allow trailing punctuation/spaces)
+    r"^(hi|hello|hey|thanks|thank you|ok|okay|got it|sure|yes|no|nope|yep|cool|great|awesome|nice|perfect|alright|fine|sounds good|makes sense|understood|correct|right|wrong)[\s!.?,]*$",
+    # "Thank you + anything casual" — allow trailing text AND trailing punctuation
+    r"^thank(s| you)[,\s]+(will|i will|i'll|sounds|ok|okay|great|will think|will consider|noted|got it|appreciate)[^!?]{0,80}[.!?,\s]*$",
+    # Generic question starters with no personal content
+    r"^(what is|what are|what does|what do|what all do|what all|how do|how does|how can|how to|can you|could you|please|explain|tell me|show me|give me|list|describe|define|compare|contrast)\b",
+    # Task/action starters
     r"^(calculate|compute|convert|translate|write|code|create|generate|make|build|fix|debug|find|search|look up|summarize|summarise)\b",
+    # Contraction question starters
     r"^(what'?s|where'?s|who'?s|when'?s|why'?s|how'?s)\b",
+    # Pure math
     r"^[\d\s\+\-\*\/\(\)=]+$",
+    # Follow-up continuation questions — no personal content
+    r"^any (ideas|suggestions|tips|thoughts|advice|recommendations|alternatives|options)\b",
+    r"^(what (should|would|do) (i|you|we))\b",
+    r"^(how (should|would|do|can) (i|you|we))\b",
+    r"^(which (is|would be|do you) (best|better|recommended|preferred|suggest))\b",
+    r"^(should i|would you|do you think|what do you think|what would you|what would you recommend)\b",
+    r"^(tell me more|can you elaborate|can you explain|more details|go on|continue|and then|what else)\b",
+    r"^why\b[^,]{0,40}$",
+    r"^(is it|is this|is that|are they|are these)\b",
 ]
 
 _COMPILED_STORE = [re.compile(p, re.IGNORECASE) for p in _STORE_SIGNALS]
@@ -179,10 +186,8 @@ def _empty_decision(reason: str) -> RoutingDecision:
     return RoutingDecision(
         trigger_user_memory=False,
         trigger_episodic=False,
-        trigger_user_db=False,
         user_memories=[],
         episodic=EpisodicDecision(should_store=False),
-        user_db=UserDbUpdate(should_update=False),
         router_reasoning=f"[pre-filter skipped: {reason}]",
         skipped=True,
     )
@@ -240,9 +245,40 @@ USER MEMORY (Neo4j) — 4 types:
   goal:       wants to achieve — project_goal, career_goal, learning_goal
   constraint: hard limits — budget_constraint, tech_constraint
 
-canonical_key conventions (use EXACTLY):
-  name, age, location, occupation, employer, coding_language, ui_theme,
-  diet, primary_goal, career_goal, project_goal, tech_constraint, budget_constraint
+canonical_key conventions — use EXACTLY these keys, never invent new ones:
+  IDENTITY:   name, age, gender
+  LOCATION:   location          ← NOT city, place, residence, hometown, current_city
+  WORK:       occupation        ← NOT job, role, position, title, job_title
+              employer          ← NOT company, workplace, works_at, organization
+                                ← CRITICAL: only store employer when user CURRENTLY works there
+                                   WRONG: "I got an offer from Amazon"  → do NOT store employer=Amazon
+                                   WRONG: "I am thinking of joining Google" → do NOT store employer=Google
+                                   WRONG: "I might leave Flipkart" → do NOT change employer
+                                   RIGHT: "I joined Amazon" → store employer=Amazon
+                                   RIGHT: "I now work at Google" → store employer=Google
+                                   RIGHT: "I started at Microsoft" → store employer=Microsoft
+                                   For offers, store as fact with key "received_offer" instead
+              team              ← NOT department, squad, group
+  TECH:       coding_language   ← NOT language, primary_language, tech, stack, pl
+              framework         ← NOT library, tool (unless it IS a framework)
+              os                ← NOT operating_system, platform
+              editor            ← NOT ide, text_editor
+  GOALS:      primary_goal      ← NOT goal, main_goal, objective
+              career_goal       ← NOT job_goal, work_goal
+              project_goal      ← NOT current_project_goal
+              learning_goal     ← NOT study_goal, skill_goal
+  CONSTRAINTS:budget_constraint ← NOT budget, money_limit, financial_constraint
+              tech_constraint   ← NOT technical_constraint, stack_constraint
+  LIFESTYLE:  diet              ← NOT food_preference, eating_habit
+              health            ← NOT medical, condition
+              hobby             ← NOT interest, pastime
+
+CONFLICT RULE — if the user states something that contradicts a previous fact,
+use the SAME canonical_key as the previous memory so the state machine can
+transition it correctly. Example:
+  Previous: employer="works at Google"
+  New info:  "I joined Meta last month"
+  Correct:   canonical_key="employer", content="works at Meta"  ← same key
 
 EPISODIC (MongoDB) — store ONLY for high-value moments:
   ✓ STORE: Personal decisions made (chose X over Y, decided to switch)
@@ -253,14 +289,14 @@ EPISODIC (MongoDB) — store ONLY for high-value moments:
   ✓ STORE: Multi-session investigations where user is building something real
 
   ✗ SKIP: Casual questions about a topic ("how does X work?")
-  ✗ SKIP: Brief curiosity without personal stakes ("what's the difference between X and Y")
+  ✗ SKIP: Brief curiosity without personal stakes
   ✗ SKIP: Simple lookups with no emotional or project connection
   ✗ SKIP: Small talk, greetings, continuations
   ✗ SKIP: Learning a concept without a specific goal or struggle attached
 
   importance_score 1-10:
     1-4: Routine learning, casual questions → these should NOT be stored
-    5-6: Meaningful but not pivotal (exploring a library, making a minor decision)
+    5-6: Meaningful but not pivotal
     7-8: Significant event (major decision, real struggle, important milestone)
     9-10: Life-changing event (job change, major launch, serious problem)
 
@@ -268,7 +304,6 @@ EPISODIC (MongoDB) — store ONLY for high-value moments:
 {
   "trigger_user_memory": true|false,
   "trigger_episodic": true|false,
-  "trigger_user_db": false,
   "router_reasoning": "one sentence",
   "user_memories": [
     {"memory_type": "fact|preference|goal|constraint", "content": "...",
@@ -283,15 +318,14 @@ EPISODIC (MongoDB) — store ONLY for high-value moments:
     "importance_score": 1.0-10.0,
     "key_entities": [],
     "tags": []
-  },
-  "user_db": {"should_update": false, "fields": {}}
+  }
 }
 
 Rules:
 - Extract ALL facts/preferences/goals/constraints from the message — a single message can contain several
 - Only extract what USER explicitly states, never from assistant responses
 - If nothing to store: all trigger_* false, empty arrays
-- Use same canonical_key for same concept every time
+- Use EXACT canonical_key from the list above — never deviate
 - Set importance_score honestly — most turns are 1-4, not 7+"""
 
 
@@ -368,12 +402,6 @@ async def route(
         tags=                ep_raw.get("tags", [])
     )
 
-    db_raw  = raw.get("user_db", {})
-    user_db = UserDbUpdate(
-        should_update=bool(db_raw.get("should_update", False)),
-        fields=       db_raw.get("fields", {})
-    )
-
     # ── Stage 3: episodic worthiness gate ────────────────────
     # LLM said store — but does it actually meet the bar?
     episodic_triggered = (
@@ -392,10 +420,8 @@ async def route(
     return RoutingDecision(
         trigger_user_memory= bool(raw.get("trigger_user_memory", False)) and len(user_memories) > 0,
         trigger_episodic=    episodic_triggered,
-        trigger_user_db=     bool(raw.get("trigger_user_db", False)) and user_db.should_update,
         user_memories=       user_memories,
         episodic=            episodic,
-        user_db=             user_db,
         router_reasoning=    raw.get("router_reasoning", ""),
         skipped=             False,
     )

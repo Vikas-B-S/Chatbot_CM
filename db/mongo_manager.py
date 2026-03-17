@@ -25,6 +25,9 @@ Each episodic memory document:
   related_ids      list[str] — manually linked related episode IDs
   is_summary       bool      — True if this is a consolidation summary
   source_ids       list[str] — for summary episodes: which episodes it covers
+  superseded       bool      — True if forgotten/consolidated
+  superseded_at    datetime  — when it was marked superseded (null if active)
+  supersede_reason string    — why it was superseded (stale/pruned/consolidated/abandoned)
   created_at       datetime
   updated_at       datetime
 
@@ -37,14 +40,27 @@ Session-scoping + cross-session fallback (v3.3)
   (e.g. a brand new session with no episodes yet), it falls back to
   returning the most important episodes across ALL sessions.
 
-  This ensures returning users always get useful episodic context
-  even at turn 1 of a new session, instead of an empty panel.
-
-  _CROSS_SESSION_THRESHOLD = 2  (fall back if fewer than 2 found)
-
 4-Component Retrieval Scoring
 ──────────────────────────────
   final = (0.50 × relevance) + (0.20 × recency) + (0.20 × importance) + (0.10 × access_freq)
+
+Forget strategy (v3.4)
+──────────────────────
+  Three-stage forgetting for MongoDB episodic memories:
+
+  Stage 1 — Stale detection (forget_stale_episodes):
+    Mark as superseded if ANY condition met:
+      A) age > 60d + importance < 5.0 + access_count < 2   (low-value, ignored)
+      B) age > 180d + access_count == 0                     (never retrieved, ever)
+      C) outcome == "abandoned" + age > 30d + importance < 6 (user gave up, old)
+      D) outcome == "resolved" + age > 120d + access_count == 0 (done, forgotten)
+
+  Stage 2 — Hard prune (prune_superseded_episodes):
+    Delete superseded docs older than 180 days (not summary episodes).
+    Summaries are kept longer (365 days) because they cover many episodes.
+
+  Stage 3 — run_mongo_maintenance: calls stage 1 then stage 2.
+    Triggered on session creation (background) — same as Neo4j decay.
 """
 
 import hashlib
@@ -67,10 +83,21 @@ _W_IMPORTANCE = 0.20
 _W_ACCESS     = 0.10
 _RECENCY_HALF_LIFE = 30   # days
 
-# Cross-session fallback threshold (v3.3)
-# If fewer than this many episodes found in current session,
-# fall back to pulling top episodes across all sessions.
 _CROSS_SESSION_THRESHOLD = 2
+
+# ── Forget thresholds ────────────────────────────────────────────────────────
+# Stage 1: stale detection
+_FORGET_LOW_VALUE_DAYS       = 60    # A: old low-importance low-access episodes
+_FORGET_LOW_VALUE_MAX_IMP    = 5.0   # A: importance threshold
+_FORGET_LOW_VALUE_MAX_ACCESS = 2     # A: access count threshold
+_FORGET_NEVER_READ_DAYS      = 180   # B: never retrieved at all
+_FORGET_ABANDONED_DAYS       = 30    # C: abandoned episodes
+_FORGET_ABANDONED_MAX_IMP    = 6.0   # C: importance threshold for abandoned
+_FORGET_RESOLVED_DAYS        = 120   # D: resolved, never re-read
+
+# Stage 2: hard prune
+_PRUNE_SUPERSEDED_DAYS       = 180   # delete superseded episodes older than this
+_PRUNE_SUMMARY_DAYS          = 365   # summaries kept longer
 
 
 # ─── Connection ───────────────────────────────────────────────────────────────
@@ -87,7 +114,6 @@ def _col():
 
 
 async def _get_collection():
-    """Alias used by lifecycle.py consolidation helpers."""
     return _col()
 
 
@@ -106,6 +132,20 @@ async def init_mongo():
     await col.create_index([("user_id", 1), ("content_hash", 1)])
     await col.create_index("memory_id", unique=True)
     await col.create_index([("session_id", 1)])
+
+    # Indexes for forget mechanism queries
+    await col.create_index(
+        [("user_id", 1), ("superseded", 1), ("created_at", -1)],
+        name="idx_user_superseded_age"
+    )
+    await col.create_index(
+        [("user_id", 1), ("last_accessed_at", 1), ("importance_score", 1)],
+        name="idx_user_access_importance"
+    )
+    await col.create_index(
+        [("user_id", 1), ("outcome", 1), ("created_at", -1)],
+        name="idx_user_outcome_age"
+    )
 
     try:
         await col.create_index(
@@ -173,7 +213,6 @@ def _now() -> datetime:
 
 
 def _serialize(doc: dict) -> dict:
-    """Convert ObjectId and datetime for JSON serialisation."""
     doc.pop("_id", None)
     for k, v in doc.items():
         if isinstance(v, datetime):
@@ -197,7 +236,7 @@ async def store_episodic_memory(
     tags: list = None,
     topic_cluster: str = "",
     importance_score: float = 5.0,
-    embedding: list = None,   # optional pre-computed embedding (lifecycle use)
+    embedding: list = None,
 ) -> str:
     """
     Write an episodic memory with full deduplication logic.
@@ -256,6 +295,8 @@ async def store_episodic_memory(
         "is_summary":          False,
         "source_ids":          [],
         "superseded":          False,
+        "superseded_at":       None,
+        "supersede_reason":    None,
         "created_at":          now,
         "updated_at":          now,
     }
@@ -323,32 +364,28 @@ async def get_user_episodic_memories(
 ) -> list:
     """
     Retrieve episodic memories for a user.
+    Only returns non-superseded episodes.
 
-    Session-scoping with cross-session fallback (v3.3):
-      Step 1 — Try current session first (focused, relevant)
-      Step 2 — If fewer than _CROSS_SESSION_THRESHOLD found,
-                fall back to top episodes across ALL sessions
-                ranked by importance + recency.
-
-      This ensures new sessions always get useful episodic context
-      instead of an empty list. The fallback episodes are tagged
-      with their source session so the LLM knows they are from
-      previous conversations.
-
-    Scoring (when query provided):
-      (0.50 × relevance) + (0.20 × recency) + (0.20 × importance) + (0.10 × access_freq)
+    Three-stage retrieval (v3.5):
+      Stage 1 — text search within current session (keyword match)
+      Stage 2 — keyword-miss fallback: if Stage 1 returned 0 results but
+                 a query was provided, retry WITHOUT the text filter using
+                 importance + recency ranking. This handles short follow-up
+                 questions like "Which is best?", "Tell me more", "What do
+                 you think?" that have no keyword overlap with stored episodes
+                 but are clearly continuations of the current context.
+      Stage 3 — cross-session fallback: if still below threshold, pull top
+                 episodes from other sessions by importance + recency.
     """
     col = _col()
-
-    # Base filter — always exclude superseded
     base_filter: dict = {"user_id": user_id, "superseded": {"$ne": True}}
 
-    # ── Step 1: try current session ───────────────────────────
     session_docs = []
     if session_id:
         session_filter = {**base_filter, "session_id": session_id}
 
         if not query:
+            # No query — pure importance + recency ranking
             cursor = (
                 col.find(session_filter, {"_id": 0})
                    .sort([("importance_score", -1), ("created_at", -1)])
@@ -356,31 +393,47 @@ async def get_user_episodic_memories(
             )
             session_docs = await cursor.to_list(length=limit)
         else:
-            # Text search within this session
+            # Stage 1 — text search
             text_filter     = {**session_filter, "$text": {"$search": query}}
             candidate_limit = limit * 5
-            cursor = (
-                col.find(text_filter, {"_id": 0, "score": {"$meta": "textScore"}})
-                   .sort([("score", {"$meta": "textScore"})])
-                   .limit(candidate_limit)
-            )
-            session_docs = await cursor.to_list(length=candidate_limit)
-            session_docs = _score_and_rank(session_docs, limit)
+            try:
+                cursor = (
+                    col.find(text_filter, {"_id": 0, "score": {"$meta": "textScore"}})
+                       .sort([("score", {"$meta": "textScore"})])
+                       .limit(candidate_limit)
+                )
+                candidates = await cursor.to_list(length=candidate_limit)
+                session_docs = _score_and_rank(candidates, limit)
+            except Exception:
+                session_docs = []
 
-    # ── Step 2: cross-session fallback ───────────────────────
-    # If current session has fewer than threshold episodes,
-    # pull top episodes from ALL sessions to fill the gap.
+            # Stage 2 — keyword-miss fallback
+            # Fires when text search returned nothing — short follow-up questions
+            # like "Which is best?" have no keyword overlap with stored episodes
+            # but the user clearly expects episodic context. Fall back to the
+            # most important recent episodes from this session without filtering.
+            if len(session_docs) == 0:
+                cursor = (
+                    col.find(session_filter, {"_id": 0})
+                       .sort([("importance_score", -1), ("created_at", -1)])
+                       .limit(limit)
+                )
+                session_docs = await cursor.to_list(length=limit)
+                if session_docs:
+                    print(f"  ↳ Episodic keyword-miss fallback: "
+                          f"query '{query[:40]}' had no text matches → "
+                          f"returning top {len(session_docs)} by importance")
+
+    # Stage 3 — cross-session fallback
     if len(session_docs) < _CROSS_SESSION_THRESHOLD:
-        needed        = limit - len(session_docs)
-        existing_ids  = {d["memory_id"] for d in session_docs}
+        needed       = limit - len(session_docs)
+        existing_ids = {d["memory_id"] for d in session_docs}
 
-        # Exclude already-found episodes and current session (already searched)
         fallback_filter = {
             **base_filter,
             "memory_id": {"$nin": list(existing_ids)},
         }
         if session_id:
-            # Exclude current session — already searched above
             fallback_filter["session_id"] = {"$ne": session_id}
 
         if not query:
@@ -391,15 +444,28 @@ async def get_user_episodic_memories(
             )
             fallback_docs = await cursor.to_list(length=needed)
         else:
+            # Try text search first for cross-session too
             text_filter     = {**fallback_filter, "$text": {"$search": query}}
             candidate_limit = needed * 5
-            cursor = (
-                col.find(text_filter, {"_id": 0, "score": {"$meta": "textScore"}})
-                   .sort([("score", {"$meta": "textScore"})])
-                   .limit(candidate_limit)
-            )
-            fallback_docs = await cursor.to_list(length=candidate_limit)
-            fallback_docs = _score_and_rank(fallback_docs, needed)
+            try:
+                cursor = (
+                    col.find(text_filter, {"_id": 0, "score": {"$meta": "textScore"}})
+                       .sort([("score", {"$meta": "textScore"})])
+                       .limit(candidate_limit)
+                )
+                candidates    = await cursor.to_list(length=candidate_limit)
+                fallback_docs = _score_and_rank(candidates, needed)
+            except Exception:
+                fallback_docs = []
+
+            # Keyword-miss fallback for cross-session too
+            if len(fallback_docs) == 0:
+                cursor = (
+                    col.find(fallback_filter, {"_id": 0})
+                       .sort([("importance_score", -1), ("created_at", -1)])
+                       .limit(needed)
+                )
+                fallback_docs = await cursor.to_list(length=needed)
 
         if fallback_docs:
             print(f"  ↳ Episodic cross-session fallback: "
@@ -415,10 +481,6 @@ async def get_user_episodic_memories(
 
 
 def _score_and_rank(candidates: list, limit: int) -> list:
-    """
-    Apply 4-component scoring to text-search candidates and return top-k.
-    Used by both session and fallback retrieval paths.
-    """
     if not candidates:
         return []
 
@@ -448,8 +510,8 @@ async def _bump_access(col, memory_ids: list):
         return
     await col.update_many(
         {"memory_id": {"$in": memory_ids}},
-        {"$inc":  {"access_count": 1},
-         "$set":  {"last_accessed_at": _now()}}
+        {"$inc": {"access_count": 1},
+         "$set": {"last_accessed_at": _now()}}
     )
 
 
@@ -487,6 +549,7 @@ async def get_ongoing_episodes(user_id: str) -> list:
             {"_id": 0}
         )
         .sort([("importance_score", -1), ("created_at", -1)])
+        .limit(20)
     )
     return await cursor.to_list(length=20)
 
@@ -520,6 +583,196 @@ async def get_episodes_by_tags(user_id: str, tags: list, limit: int = 3) -> list
     return await cursor.to_list(length=limit)
 
 
+# ─── Forget mechanism ─────────────────────────────────────────────────────────
+
+async def forget_stale_episodes(user_id: str) -> dict:
+    """
+    Stage 1 of MongoDB forget mechanism.
+    Marks old, unused, or resolved episodes as superseded.
+
+    Four conditions — episode is superseded if ANY is met:
+      A) age > 60d  AND importance < 5.0  AND access_count < 2
+         → low-value and ignored by retrieval
+      B) age > 180d AND access_count == 0
+         → never retrieved in 6 months, clearly irrelevant
+      C) outcome == "abandoned" AND age > 30d AND importance < 6.0
+         → user gave up and hasn't thought about it since
+      D) outcome == "resolved"  AND age > 120d AND access_count == 0
+         → fully done, never revisited
+
+    Summary episodes (is_summary=True) are never superseded here —
+    they cover many other episodes and should outlive their sources.
+
+    High-importance episodes (>= 8.0) are never superseded by this
+    function regardless of other conditions — they're definitionally
+    memorable (major life events, job changes, etc).
+    """
+    col = _col()
+    now = _now()
+
+    def cutoff(days: int) -> datetime:
+        return now - timedelta(days=days)
+
+    # Shared safety conditions applied to all rules
+    base_safety = {
+        "user_id":        user_id,
+        "superseded":     {"$ne": True},
+        "is_summary":     {"$ne": True},
+        "importance_score": {"$lt": 8.0},   # never auto-forget high-importance episodes
+    }
+
+    results = {"a": 0, "b": 0, "c": 0, "d": 0}
+    now_iso = now
+
+    # ── Rule A: old + low importance + rarely accessed ────────
+    filter_a = {
+        **base_safety,
+        "created_at":       {"$lt": cutoff(_FORGET_LOW_VALUE_DAYS)},
+        "importance_score": {"$lt": _FORGET_LOW_VALUE_MAX_IMP},
+        "access_count":     {"$lt": _FORGET_LOW_VALUE_MAX_ACCESS},
+    }
+    result = await col.update_many(
+        filter_a,
+        {"$set": {
+            "superseded":       True,
+            "superseded_at":    now_iso,
+            "supersede_reason": "stale:low_value",
+            "updated_at":       now_iso,
+        }}
+    )
+    results["a"] = result.modified_count
+
+    # ── Rule B: very old + never accessed at all ──────────────
+    filter_b = {
+        **base_safety,
+        "created_at":   {"$lt": cutoff(_FORGET_NEVER_READ_DAYS)},
+        "access_count": 0,
+    }
+    result = await col.update_many(
+        filter_b,
+        {"$set": {
+            "superseded":       True,
+            "superseded_at":    now_iso,
+            "supersede_reason": "stale:never_read",
+            "updated_at":       now_iso,
+        }}
+    )
+    results["b"] = result.modified_count
+
+    # ── Rule C: abandoned + old + low importance ──────────────
+    filter_c = {
+        **base_safety,
+        "outcome":          "abandoned",
+        "created_at":       {"$lt": cutoff(_FORGET_ABANDONED_DAYS)},
+        "importance_score": {"$lt": _FORGET_ABANDONED_MAX_IMP},
+    }
+    result = await col.update_many(
+        filter_c,
+        {"$set": {
+            "superseded":       True,
+            "superseded_at":    now_iso,
+            "supersede_reason": "stale:abandoned",
+            "updated_at":       now_iso,
+        }}
+    )
+    results["c"] = result.modified_count
+
+    # ── Rule D: resolved + old + never re-read ────────────────
+    filter_d = {
+        **base_safety,
+        "outcome":      "resolved",
+        "created_at":   {"$lt": cutoff(_FORGET_RESOLVED_DAYS)},
+        "access_count": 0,
+    }
+    result = await col.update_many(
+        filter_d,
+        {"$set": {
+            "superseded":       True,
+            "superseded_at":    now_iso,
+            "supersede_reason": "stale:resolved_forgotten",
+            "updated_at":       now_iso,
+        }}
+    )
+    results["d"] = result.modified_count
+
+    total = sum(results.values())
+    if total > 0:
+        print(f"  · forget_episodes [{user_id[:8]}]: "
+              f"{results['a']} low-value, {results['b']} never-read, "
+              f"{results['c']} abandoned, {results['d']} resolved → {total} superseded")
+
+    return {
+        "superseded_low_value":     results["a"],
+        "superseded_never_read":    results["b"],
+        "superseded_abandoned":     results["c"],
+        "superseded_resolved":      results["d"],
+        "total_superseded":         total,
+    }
+
+
+async def prune_superseded_episodes(user_id: str) -> dict:
+    """
+    Stage 2 of MongoDB forget mechanism.
+    Hard-deletes superseded documents after they've sat long enough.
+
+    Normal superseded episodes → delete after 180 days of being superseded.
+    Summary episodes            → delete after 365 days (longer — they cover many sources).
+
+    We keep superseded docs for a grace period so:
+      - The user can still query "what did you forget?" via stats
+      - Ongoing summaries that reference source_ids still resolve correctly
+      - Nothing is deleted instantly (safe to roll back if decay was too aggressive)
+    """
+    col = _col()
+    now = _now()
+
+    def supersede_cutoff(days: int) -> datetime:
+        return now - timedelta(days=days)
+
+    # Delete non-summary superseded episodes past grace period
+    result_normal = await col.delete_many({
+        "user_id":       user_id,
+        "superseded":    True,
+        "is_summary":    {"$ne": True},
+        "superseded_at": {"$lt": supersede_cutoff(_PRUNE_SUPERSEDED_DAYS)},
+    })
+
+    # Delete summary episodes past their longer grace period
+    result_summary = await col.delete_many({
+        "user_id":       user_id,
+        "superseded":    True,
+        "is_summary":    True,
+        "superseded_at": {"$lt": supersede_cutoff(_PRUNE_SUMMARY_DAYS)},
+    })
+
+    total = result_normal.deleted_count + result_summary.deleted_count
+    if total > 0:
+        print(f"  · prune_episodes [{user_id[:8]}]: "
+              f"{result_normal.deleted_count} normal + "
+              f"{result_summary.deleted_count} summaries deleted")
+
+    return {
+        "pruned_normal":   result_normal.deleted_count,
+        "pruned_summaries": result_summary.deleted_count,
+        "total_pruned":    total,
+    }
+
+
+async def run_mongo_maintenance(user_id: str) -> dict:
+    """
+    Full MongoDB forget pipeline: forget stale episodes then prune old superseded ones.
+    Safe to call frequently — only touches stale/superseded records.
+    Triggered on session creation (background) alongside Neo4j decay.
+    """
+    forget_result = await forget_stale_episodes(user_id)
+    prune_result  = await prune_superseded_episodes(user_id)
+    return {
+        "user_id": user_id,
+        "forget":  forget_result,
+        "prune":   prune_result,
+    }
+
+
 # ─── Consolidation ────────────────────────────────────────────────────────────
 
 async def consolidate_old_episodes(
@@ -529,8 +782,8 @@ async def consolidate_old_episodes(
     max_access_count: int = 2,
     dry_run: bool = False
 ) -> dict:
-    col     = _col()
-    cutoff  = _now() - timedelta(days=older_than_days)
+    col    = _col()
+    cutoff = _now() - timedelta(days=older_than_days)
 
     candidates = await col.find(
         {
@@ -561,6 +814,7 @@ async def consolidate_old_episodes(
     summaries_created  = 0
     processed_clusters = []
     summary_id         = "dry_run"
+    now                = _now()
 
     for cluster, episodes in clusters_to_process.items():
         episode_lines = [
@@ -582,7 +836,6 @@ async def consolidate_old_episodes(
 
         if not dry_run:
             summary_id = f"ep_{uuid.uuid4().hex[:16]}"
-            now = _now()
             await col.insert_one({
                 "memory_id":           summary_id,
                 "user_id":             user_id,
@@ -606,12 +859,19 @@ async def consolidate_old_episodes(
                 "is_summary":          True,
                 "source_ids":          source_ids,
                 "superseded":          False,
+                "superseded_at":       None,
+                "supersede_reason":    None,
                 "created_at":          now,
                 "updated_at":          now,
             })
             await col.update_many(
                 {"memory_id": {"$in": source_ids}},
-                {"$set": {"superseded": True, "updated_at": now}}
+                {"$set": {
+                    "superseded":       True,
+                    "superseded_at":    now,
+                    "supersede_reason": "consolidated",
+                    "updated_at":       now,
+                }}
             )
 
         consolidated_count += len(episodes)
@@ -638,8 +898,16 @@ async def get_episodic_stats(user_id: str) -> dict:
     total      = await col.count_documents({"user_id": user_id})
     active     = await col.count_documents({"user_id": user_id, "superseded": {"$ne": True}})
     superseded = await col.count_documents({"user_id": user_id, "superseded": True})
-    ongoing    = await col.count_documents({"user_id": user_id, "outcome": "ongoing", "superseded": {"$ne": True}})
+    ongoing    = await col.count_documents({"user_id": user_id, "outcome": "ongoing",    "superseded": {"$ne": True}})
     summaries  = await col.count_documents({"user_id": user_id, "is_summary": True})
+
+    # Breakdown by supersede reason
+    reason_pipeline = [
+        {"$match": {"user_id": user_id, "superseded": True}},
+        {"$group": {"_id": "$supersede_reason", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    reason_counts = await col.aggregate(reason_pipeline).to_list(length=20)
 
     pipeline = [
         {"$match": {"user_id": user_id, "superseded": {"$ne": True}}},
@@ -662,6 +930,7 @@ async def get_episodic_stats(user_id: str) -> dict:
         "superseded_episodes":  superseded,
         "ongoing_episodes":     ongoing,
         "summary_episodes":     summaries,
+        "supersede_reasons":    {r["_id"]: r["count"] for r in reason_counts},
         "cluster_distribution": [
             {"cluster": c["_id"], "count": c["count"],
              "avg_importance": round(c["avg_importance"], 1)}
@@ -671,14 +940,13 @@ async def get_episodic_stats(user_id: str) -> dict:
     }
 
 
-# ─── Lifecycle helpers (used by memory/lifecycle.py) ─────────────────────────
+# ─── Lifecycle helpers ────────────────────────────────────────────────────────
 
 async def get_episodes_for_consolidation(
     user_id: str,
     older_than: datetime,
     max_importance: float = 7.9
 ) -> list:
-    """Returns old low-importance episodes eligible for lifecycle consolidation."""
     col    = _col()
     cursor = col.find({
         "user_id":          user_id,
@@ -692,7 +960,6 @@ async def get_episodes_for_consolidation(
 
 
 async def delete_episodes_by_ids(user_id: str, memory_ids: list) -> int:
-    """Delete specific episodes by ID — only for this user (safety check)."""
     from bson import ObjectId
     col       = _col()
     valid_ids = []

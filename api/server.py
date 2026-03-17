@@ -5,19 +5,13 @@ KEY FIX (v3.2):
   Background storage is now handled by FastAPI BackgroundTasks instead of
   asyncio.create_task() inside the streaming generator.
 
-  Root cause of the previous bug:
-    The SSE client closes the connection as soon as it receives the final
-    "done: true" chunk. FastAPI then cancels the generator. Since
-    asyncio.create_task(_background_store()) was called at the END of the
-    generator (after yielding all tokens), the client disconnect happened
-    first — the task was never created, so nothing was ever stored.
+FORGET MECHANISM (v3.4):
+  Memory maintenance (decay + prune) is triggered:
+    1. On every session creation — passive background maintenance
+    2. Via POST /users/{user_id}/memory/maintenance — manual trigger
 
-  The fix:
-    chat_stream() is now split into two functions:
-      1. stream_tokens()  — pure generator, yields tokens + done chunk
-      2. background_store_wrapper() — called via BackgroundTasks AFTER
-         the response is fully sent, guaranteed to run even if client
-         disconnects early.
+  This is safe to call frequently — decay only touches memories that
+  haven't been accessed within the decay window (30d normal / 3d temporary).
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -91,7 +85,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="MNEMO — Contextual Chatbot API",
-    version="3.2.0",
+    version="3.5.0",
     lifespan=lifespan
 )
 
@@ -148,7 +142,7 @@ class ChatResp(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.2.0"}
+    return {"status": "ok", "version": "3.5.0"}
 
 
 # ─── Auth ─────────────────────────────────────────────────────
@@ -211,31 +205,91 @@ async def get_user_memory(
 ):
     if not await sql.get_user(user_id): raise HTTPException(404, "User not found")
     try:
+        graph = await neo4j.get_full_memory_graph(user_id, session_id=session_id)
         if type:
-            mems = await neo4j.get_user_memories(user_id, session_id=session_id, memory_type=type)
-            return {"user_id": user_id, "type": type, "memories": mems, "count": len(mems)}
-        return await neo4j.get_full_memory_graph(user_id, session_id=session_id)
+            return {
+                "user_id":    user_id,
+                "type":       type,
+                "memories":   graph["memories_by_type"].get(type, []),
+                "fading":     [m for m in graph.get("fading_memories", [])
+                               if m.get("memory_type") == type],
+            }
+        return graph
     except Exception as e:
         raise HTTPException(503, f"Neo4j unavailable: {e}")
 
-@app.get("/users/{user_id}/memory/history")
-async def get_memory_history(user_id: str, topic: str = Query(...)):
-    if not await sql.get_user(user_id): raise HTTPException(404, "User not found")
+
+# ─── Memory maintenance (forget mechanism) ────────────────────
+
+@app.post("/users/{user_id}/memory/maintenance")
+async def run_maintenance(user_id: str, background_tasks: BackgroundTasks):
+    """
+    Manually trigger memory decay + prune for a user.
+    Also called automatically in background on every session creation.
+
+    Decay reduces confidence of memories not accessed in 30d (normal) or 3d (temporary).
+    Prune deactivates memories whose confidence has fallen below 0.25.
+    """
+    if not await sql.get_user(user_id):
+        raise HTTPException(404, "User not found")
+
+    background_tasks.add_task(_run_maintenance_bg, user_id)
+    return {
+        "status":  "scheduled",
+        "user_id": user_id,
+        "message": "Memory maintenance scheduled in background"
+    }
+
+
+@app.post("/users/{user_id}/memory/maintenance/sync")
+async def run_maintenance_sync(user_id: str):
+    """
+    Synchronous version of maintenance — waits for result.
+    Runs both Neo4j decay+prune and MongoDB forget+prune.
+    Useful for testing/debugging the forget mechanism.
+    """
+    if not await sql.get_user(user_id):
+        raise HTTPException(404, "User not found")
+
+    neo4j_result = await neo4j.run_memory_maintenance(user_id)
+    mongo_result = await mongo.run_mongo_maintenance(user_id)
+
+    return {
+        "user_id": user_id,
+        "neo4j":   neo4j_result,
+        "mongodb": mongo_result,
+    }
+
+
+async def _run_maintenance_bg(user_id: str):
+    """
+    Background wrapper for full memory maintenance — Neo4j + MongoDB.
+    Catches all exceptions independently so one failure doesn't block the other.
+    """
+    # Neo4j: confidence decay + prune dead memories
     try:
-        history = await neo4j.get_fact_history(user_id, topic)
-        return {
-            "user_id":       user_id,
-            "topic":         topic,
-            "current_facts": [h for h in history if h["status"] == "current"],
-            "expired_facts": [h for h in history if h["status"] == "expired"],
-            "total":         len(history)
-        }
+        neo4j_result = await neo4j.run_memory_maintenance(user_id)
+        neo4j_total  = (neo4j_result["decay"]["total_decayed"] +
+                        neo4j_result["prune"]["pruned"])
+        if neo4j_total > 0:
+            print(f"  ✓ Neo4j maintenance [{user_id[:8]}]: "
+                  f"{neo4j_result['decay']['total_decayed']} decayed, "
+                  f"{neo4j_result['prune']['pruned']} pruned")
     except Exception as e:
-        raise HTTPException(503, f"Neo4j unavailable: {e}")
+        print(f"  ⚠ Neo4j maintenance failed for {user_id[:8]}: {e}")
 
-@app.get("/users/{user_id}/memory/timeline")
-async def memory_timeline(user_id: str, key: str):
-    return await neo4j.get_memory_timeline(user_id, key)
+    # MongoDB: forget stale episodes + prune superseded docs
+    try:
+        mongo_result = await mongo.run_mongo_maintenance(user_id)
+        mongo_total  = (mongo_result["forget"]["total_superseded"] +
+                        mongo_result["prune"]["total_pruned"])
+        if mongo_total > 0:
+            print(f"  ✓ MongoDB maintenance [{user_id[:8]}]: "
+                  f"{mongo_result['forget']['total_superseded']} forgotten, "
+                  f"{mongo_result['prune']['total_pruned']} pruned")
+    except Exception as e:
+        print(f"  ⚠ MongoDB maintenance failed for {user_id[:8]}: {e}")
+
 
 @app.get("/users/{user_id}/episodic")
 async def get_user_episodic(
@@ -258,11 +312,23 @@ async def get_user_sessions(user_id: str):
 # ─── Sessions ─────────────────────────────────────────────────
 
 @app.post("/sessions", status_code=201)
-async def create_session(req: CreateSessionReq):
+async def create_session(req: CreateSessionReq, background_tasks: BackgroundTasks):
+    """
+    Create a new session. Also schedules memory maintenance in background —
+    this is the primary trigger for the forget mechanism. Since session
+    creation happens infrequently (once per conversation), it's the ideal
+    low-cost moment to run decay + prune without any latency impact.
+    """
     if not await sql.get_user(req.user_id): raise HTTPException(404, "User not found")
     existing = await sql.get_user_sessions(req.user_id)
     name     = req.name or f"Session {len(existing) + 1}"
-    return await sql.create_session(req.user_id, name=name)
+    session  = await sql.create_session(req.user_id, name=name)
+
+    # Schedule maintenance in background — zero latency impact on session creation
+    background_tasks.add_task(_run_maintenance_bg, req.user_id)
+
+    return session
+
 
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str):
@@ -300,13 +366,11 @@ async def get_session_summaries(session_id: str):
         raise HTTPException(503, f"Redis unavailable: {e}")
 
 
-
 @app.get("/sessions/{session_id}/turns")
 async def get_session_turns(session_id: str, limit: int = 50):
     s = await sql.get_session(session_id)
     if not s: raise HTTPException(404, "Session not found")
     turns = await sql.get_last_n_turns(session_id, n=limit)
-    # Parse router_decision JSON strings
     for t in turns:
         if t.get("router_decision") and isinstance(t["router_decision"], str):
             try:
@@ -329,10 +393,81 @@ async def get_session_context(session_id: str):
     }
 
 
+class RenameSessionReq(BaseModel):
+    name: str
+
+
+@app.patch("/sessions/{session_id}")
+async def rename_session(session_id: str, req: RenameSessionReq):
+    """Rename a session."""
+    s = await sql.get_session(session_id)
+    if not s: raise HTTPException(404, "Session not found")
+    updated = await sql.rename_session(session_id, req.name)
+    if not updated: raise HTTPException(500, "Rename failed")
+    return {"session_id": session_id, "name": req.name.strip()}
+
+
+@app.delete("/sessions/{session_id}", status_code=200)
+async def delete_session(session_id: str):
+    """
+    Delete a session and clean up all associated data across every store:
+      SQLite  — turn logs + session row
+      Redis   — L0/L1/L2 summaries + embedding hashes for this session
+      MongoDB — episodic memories scoped to this session
+
+    Neo4j memories are NOT deleted — they are user-scoped and belong
+    to the user, not the session. The forget mechanism handles their lifecycle.
+
+    Returns summary of what was deleted across all stores.
+    """
+    s = await sql.get_session(session_id)
+    if not s: raise HTTPException(404, "Session not found")
+
+    user_id = s["user_id"]
+    results = {}
+    errors  = []
+
+    # Check user still has other sessions — must keep at least one
+    all_sessions = await sql.get_user_sessions(user_id)
+    if len(all_sessions) <= 1:
+        raise HTTPException(400, "Cannot delete the only session. Create a new session first.")
+
+    # SQLite: turns + session row
+    try:
+        results["sqlite"] = await sql.delete_session(session_id)
+    except Exception as e:
+        errors.append(f"SQLite: {e}")
+        results["sqlite"] = {"error": str(e)}
+
+    # Redis: summaries + embeddings for this session
+    try:
+        deleted_keys = await redis_mgr.delete_user_summaries(
+            session_ids=[session_id], user_id=None   # user_id=None → skip handoff deletion
+        )
+        results["redis"] = {"keys_deleted": deleted_keys}
+    except Exception as e:
+        errors.append(f"Redis: {e}")
+        results["redis"] = {"error": str(e)}
+
+    # MongoDB: episodes scoped to this session
+    try:
+        col = await mongo._get_collection()
+        mongo_result = await col.delete_many({"user_id": user_id, "session_id": session_id})
+        results["mongodb"] = {"episodes_deleted": mongo_result.deleted_count}
+    except Exception as e:
+        errors.append(f"MongoDB: {e}")
+        results["mongodb"] = {"error": str(e)}
+
+    return {
+        "deleted_session_id": session_id,
+        "user_id":            user_id,
+        "results":            results,
+        "errors":             errors,
+        "status":             "complete" if not errors else "partial",
+    }
+
+
 # ─── Chat ─────────────────────────────────────────────────────
-# KEY CHANGE: background_tasks.add_task() is used instead of
-# asyncio.create_task() so storage runs AFTER the response is
-# fully sent, even if the SSE client disconnects early.
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatReq, background_tasks: BackgroundTasks):
@@ -342,8 +477,6 @@ async def chat_endpoint(req: ChatReq, background_tasks: BackgroundTasks):
     if s["user_id"] != req.user_id:          raise HTTPException(403, "Session does not belong to this user")
     if not req.message.strip():              raise HTTPException(400, "Message cannot be empty")
 
-    # Collect the full response while streaming tokens to client
-    # then schedule storage via BackgroundTasks (runs after response)
     collected = {"full_response": "", "context": None}
 
     async def event_stream():
@@ -352,15 +485,13 @@ async def chat_endpoint(req: ChatReq, background_tasks: BackgroundTasks):
                 user_id=req.user_id,
                 session_id=req.session_id,
                 user_message=req.message,
-                collected=collected   # stream_tokens writes into this dict
+                collected=collected
             ):
                 yield f"data: {_json.dumps(chunk)}\n\n"
         except Exception as e:
             print(f"  ✗ Stream error: {e}")
             yield f"data: {_json.dumps({'error': str(e)})}\n\n"
 
-    # Schedule background storage BEFORE returning the response
-    # BackgroundTasks guarantees this runs after the response is sent
     background_tasks.add_task(
         background_store_wrapper,
         user_id=req.user_id,

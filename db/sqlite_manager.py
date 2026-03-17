@@ -293,6 +293,35 @@ async def update_session_summary(session_id: str, summary: str):
         await db.commit()
 
 
+async def rename_session(session_id: str, name: str) -> bool:
+    """Rename a session. Returns True if a row was updated."""
+    name = name.strip()[:80] if name else "Untitled Session"
+    async with get_db() as db:
+        cur = await db.execute(
+            "UPDATE sessions SET name=? WHERE session_id=?", (name, session_id)
+        )
+        await db.commit()
+    return cur.rowcount > 0
+
+
+async def delete_session(session_id: str) -> dict:
+    """
+    Delete a session and all its turn logs from SQLite.
+    Redis summaries and MongoDB episodes are cleaned by server.py.
+    """
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT COUNT(*) as c FROM turn_logs WHERE session_id=?", (session_id,)
+        )
+        row  = await cur.fetchone()
+        turns = row["c"] if row else 0
+        await db.execute("DELETE FROM turn_logs WHERE session_id=?", (session_id,))
+        await db.execute("DELETE FROM sessions  WHERE session_id=?", (session_id,))
+        await db.commit()
+    return {"turns_deleted": turns, "session_deleted": 1}
+
+
 async def get_last_summarized_turn(session_id: str) -> int:
     """Returns the highest turn number that has been summarized into Redis."""
     async with get_db() as db:
